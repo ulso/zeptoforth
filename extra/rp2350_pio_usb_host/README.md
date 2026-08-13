@@ -80,8 +80,37 @@ SHA256:  07f806f909f31a7c17d748bea87ac453b222c7b0a8a93a98b67f121cce8e3308
 ```
 
 This proves the generic endpoint-zero transport on the current Cytron/BleuIO
-setup.  Complete device enumeration and CDC/ACM operation are not implemented
-yet.
+setup.
+
+## Verified Forth-owned root enumeration milestone
+
+On 2026-08-14, the definitions-only `full_enumeration_v3.fs` module used the
+same generic ABI-v3 transport to perform the complete standard control path:
+
+1. reset the root port and fetch the first eight device-descriptor bytes;
+2. assign address 1 and observe the address recovery delay;
+3. fetch and validate the complete 18-byte device descriptor;
+4. fetch the 9-byte configuration prefix and then its declared full length;
+5. bounds-walk and validate the complete descriptor tree;
+6. select its advertised configuration; and
+7. confirm the selection with `GET_CONFIGURATION`.
+
+The directly attached BleuIO enumerated as address 1, configuration 1,
+VID:PID `2DCF:6002`.  Its configuration was 67 bytes and declared two
+interfaces.  The parser found two unique interfaces, two interface
+descriptors, three endpoint descriptors, and four class-specific descriptors:
+
+```text
+interface 0: CDC control, interrupt IN  0x83, MPS 64
+interface 1: CDC data,    bulk IN       0x81, MPS 64
+                          bulk OUT      0x02, MPS 64
+```
+
+The helper finished at stage 9 with its complete flag set and no exception.
+The core-1 command status was `OK`; endpoint error, endpoint stall, and core
+fault were all zero, and the native USB Forth console remained responsive.
+This milestone does not open the discovered endpoints or implement CDC/ACM
+data transfers yet.
 
 ## Hardware and resource contract
 
@@ -187,8 +216,8 @@ arm-none-eabi-readelf -l -r \
 ## Running the current ABI-v3 checkpoint
 
 The image is a raw SRAM payload, not firmware that can be flashed by itself.
-`enumeration_v3.fs` only defines words; loading the file does not launch core 1,
-reset the port, or contact a USB device.
+`enumeration_v3.fs` and `full_enumeration_v3.fs` only define words; loading
+either file does not launch core 1, reset the port, or contact a USB device.
 
 The safe sequence is:
 
@@ -196,11 +225,13 @@ The safe sequence is:
 2. Confirm `ram-end` is `0x20060000`.
 3. Load the matching 17664-byte BIN at `0x20060000` while both cores are
    stopped, read back through `0x20064500`, and require the SHA above.
-4. Load `enumeration_v3.fs` over the native USB console.
+4. Load `enumeration_v3.fs` and `full_enumeration_v3.fs` over the native USB
+   console.
 5. Invoke `launch-pio-usb-core1-v3` exactly once.
 6. Require ABI 3, phase 4, a changing heartbeat, `fault=0`,
    `connected=1`, `full-speed=1`, and no resource conflict.
 7. Only then issue the bounded reset and generic control-transfer smoke.
+8. After the smoke succeeds, run the full control-only root enumeration.
 
 The exact first milestone can be displayed with:
 
@@ -214,8 +245,23 @@ show-v3-smoke
 
 The expected bytes are `12 01 00 02 02 02 00 08`.  Do not publish a second
 command after a timeout or stopped heartbeat; reset the complete target first.
-The next development step is Forth-owned address assignment and complete
-device/configuration descriptor enumeration using the same generic transport.
+
+The verified complete enumeration is invoked explicitly; it is never run while
+either helper file is loaded:
+
+```forth
+hex
+pio-usb-enumerate-root-control-v3 .s
+decimal
+```
+
+The four returned values are `( address configuration vid pid )`; for the
+tested BleuIO, the stack contains `1 1 2DCF 6002`.  On success,
+`pio-usb-v3-enumeration-stage` is 9,
+`pio-usb-v3-enumeration-complete?` is true, and the stable descriptor copies
+and normalized interface/endpoint records can be inspected without reusing the
+shared control buffer.  The next development step is opening the parsed CDC
+endpoints and transferring CDC/ACM data while core 0 retains class policy.
 
 ## Running the historical ABI-v2 checkpoint
 
