@@ -1,0 +1,3 @@
+[submodule "extra/rp2350_pio_usb_host/Pico-PIO-USB"]
+	path = extra/rp2350_pio_usb_host/Pico-PIO-USB
+	url = https://github.com/sekigon-gonnoc/Pico-PIO-USB.git

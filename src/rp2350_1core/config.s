@@ -25,7 +25,11 @@
         .equ cortex_m33, 1
 	.equ ram_real_start, 0x20000000
 	.equ ram_start, 0x20009000
-	.equ ram_end, 0x20082000
+	@ Reserve the upper 136 KiB of SRAM for the freestanding core 1 PIO USB
+	@ host image.  The image, its vector table, shared IPC state, and its stack
+	@ must remain entirely in SRAM so core 1 can continue running while core 0
+	@ writes the QSPI flash dictionary.
+	.equ ram_end, 0x20060000
 	.equ rstack_size, 0x0800
 	.equ rstack_top, ram_end
 	.equ stack_size, 0x0200

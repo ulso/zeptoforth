@@ -1,0 +1,191 @@
+# RP2350 core 1 PIO USB host experiment
+
+This directory contains an experimental, freestanding PIO USB host image for
+the `rp2350_1core` Zeptoforth platform.  It is currently specific to a Cytron
+MOTION 2350 Pro with a directly attached full-speed device on its USB-A port.
+
+The design deliberately separates responsibilities:
+
+- core 1 owns the timing-sensitive PIO USB transport and runs entirely from
+  SRAM;
+- core 0 keeps the native USB Zeptoforth console and will own enumeration,
+  descriptor parsing, and USB class policy;
+- runtime requests and results cross a fixed shared-SRAM mailbox.  The SIO FIFO
+  is used only for the RP2350 core-launch handshake, and its IRQ is disabled
+  again before normal execution resumes on core 0.
+
+This is research code, not yet a general USB host implementation.
+
+## Verified descriptor-smoke milestone
+
+The ABI v2 image implements one bounded command: a 50 ms bus reset followed by
+a request for the first eight bytes of the device descriptor.  On 2026-08-13,
+with a BleuIO dongle attached, the command completed without transport errors
+or stalls and returned:
+
+```text
+12 01 00 02 02 02 00 08
+```
+
+This describes a USB 2.0 CDC/ACM-class device with an 8-byte endpoint zero.
+Core 1 and the native USB Forth console then ran concurrently for more than one
+hour with a continuously advancing 1 kHz heartbeat and `fault = 0`.
+
+Reference runtime artifact:
+
+```text
+core1_pio_usb.bin
+size:    17052 bytes (0x429c)
+SHA256:  42875e20f468b57b13ce0578756ea5603b5fb581622bd0c6f3543c97b7de2a94
+```
+
+The ELF SHA may vary with debug paths and metadata.  The loadable BIN hash
+identifies the exact artifact used for this checkpoint.
+
+## Hardware and resource contract
+
+The current image assumes:
+
+- `clk_sys` is exactly 150 MHz;
+- D+ is GP24 and D- is GP25;
+- all 32 instruction words of PIO0 are exclusively available;
+- PIO0 SM0 is TX, SM1 is RX, and SM2 is edge/EOP detection;
+- DMA channel 0 is exclusively available;
+- core 1 SysTick is exclusively available;
+- TIMER0's microsecond counter is running.
+
+It does not control VBUS and must not treat GP18 as a VBUS-enable pin.
+
+The hardware preflight detects enabled SM0-SM2 and an actively busy DMA0.  It
+cannot detect an idle software claim, SM3 use, or existing PIO instructions.
+Start only from a clean reset where no other PIO or DMA code has run.
+
+## SRAM layout
+
+`src/rp2350_1core/config.s` lowers Zeptoforth's `ram_end` to `0x20060000`.
+The upper 136 KiB is reserved for the freestanding image:
+
+```text
+Zeptoforth RAM end:  0x20060000
+core 1 reservation: 0x20060000..0x20082000
+vector table:        0x20060000
+entry instruction:   0x200604c0
+initialized copy:    0x20060000..0x2006429c
+BSS:                 0x200642a0..0x20065cf4
+shared ABI:          0x20065d00..0x20065d80
+core 1 stack:        0x20081000..0x20082000
+```
+
+All executable code, constants, mutable data, vectors, and the stack must stay
+in this SRAM region.  Core 1 must never call or read QSPI/XIP while core 0 may
+write the Forth flash dictionary.
+
+## Parent Zeptoforth prerequisite
+
+The core 1 payload is only safe with the carved `rp2350_1core` parent built
+from this branch.  Build and flash that baseline before loading the SRAM image:
+
+```sh
+make rp2350_1core
+```
+
+This produces `obj/zeptoforth.rp2350_1core.uf2`.  The baseline used for the
+verified run was 265216 bytes with SHA256
+`4eec2fc4cf1c13482ce3feb1452274d27104a96eb8a4c671c909ee8e21cc0fcd`.
+After flashing it, load `src/rp2350_1core/forth/setup_full_usb.fs` with the
+normal Zeptoforth code loader to reproduce the native USB CDC console used in
+the coexistence test.  The carved baseline and the USB setup are separate from
+the raw core 1 payload; rebuilding or flashing only the latter is insufficient.
+
+## Build
+
+Initialize the pinned upstream dependency and build.  The reference artifact
+was produced with Pico SDK 2.2.0, Arm GNU Toolchain 15.3.Rel1 (GCC 15.3.1,
+binutils 2.45.1), and CMake 4.4.2.  Other toolchain or SDK versions are not yet
+verified and may produce a different, otherwise valid BIN:
+
+```sh
+git submodule update --init extra/rp2350_pio_usb_host/Pico-PIO-USB
+
+env PICO_SDK_PATH=/path/to/pico-sdk \
+  cmake -S extra/rp2350_pio_usb_host \
+        -B extra/rp2350_pio_usb_host/build \
+        -DPICO_PLATFORM=rp2350-arm-s \
+        -DPICO_BOARD=pico2 \
+        -DCMAKE_BUILD_TYPE=MinSizeRel
+
+cmake --build extra/rp2350_pio_usb_host/build \
+  --target core1_pio_usb
+
+shasum -a 256 \
+  extra/rp2350_pio_usb_host/build/core1_pio_usb.bin
+```
+
+The small original heartbeat-only image remains available with:
+
+```sh
+make -C extra/rp2350_pio_usb_host inspect
+```
+
+The address block above and `descriptor_smoke.fs` are pinned to the reference
+BIN hash.  Any rebuild that changes its hash must re-derive `core1_entry`,
+`__core1_copy_end`, `core1_shared`, and `__core1_shared_end`; do not assume
+that `.shared` stays fixed after private BSS changes.  Before running any new
+artifact, verify those symbols, confirm that it has no undefined symbols or
+relocations, and check that every allocatable/loadable section lies inside the
+reserved SRAM range:
+
+```sh
+arm-none-eabi-nm -u extra/rp2350_pio_usb_host/build/core1_pio_usb.elf
+arm-none-eabi-nm -n extra/rp2350_pio_usb_host/build/core1_pio_usb.elf
+arm-none-eabi-readelf -l -r \
+  extra/rp2350_pio_usb_host/build/core1_pio_usb.elf
+```
+
+## Running the checkpoint
+
+The image is a raw SRAM payload, not firmware that can be flashed by itself.
+The exact interactive helper words and ABI offsets are in
+`descriptor_smoke.fs`.  The safe sequence is:
+
+1. Reset into the carved `rp2350_1core` Zeptoforth baseline.
+2. Confirm `ram-end` is `0x20060000`.
+3. Load and byte-verify the BIN at `0x20060000` while core 1 is stopped.
+4. Compile the launch helper while interrupts are enabled.
+5. Launch exactly once and wait for phase `RUNNING`.
+6. Publish the descriptor command only after startup has cleared shared RAM.
+7. Require completion within one second from core 0.
+
+After the audited BIN has been loaded and verified, load the helper source and
+run the checkpoint as separate interpreter commands:
+
+```forth
+launch-pio-usb-core1
+pio-usb-status.
+descriptor-smoke .
+pio-usb-results.
+```
+
+Wait until `pio-usb-status.` reports the ABI-v2 magic, phase `4`, a changing
+heartbeat, `connected=1`, `full-speed=1`, and `fault=0` before invoking
+`descriptor-smoke`.  A successful smoke prints `-1`; `pio-usb-results.` should
+then show status `2`, command phase `6`, descriptor length `8`, no endpoint
+error/stall, and descriptor bytes beginning `12 01`.
+
+Do not paste a raw interpreter line beginning with `disable-int`: native USB
+may be starved before the rest of that line has arrived.  Compile the complete
+launch word first and invoke only the finished word.
+
+A launch must never be repeated without a full target reset.  Reset before
+loading another image or using PIO0, DMA0, GP24, or GP25 from Forth.
+
+The mailbox timeouts cannot recover if an upstream synchronous PIO/DMA wait
+loop itself hangs.  If the heartbeat stops, the native console misbehaves, or
+completion is absent after one second, perform a full reset or power cycle and
+do not publish another command.
+
+## Upstream
+
+Pico-PIO-USB is included as an unmodified Git submodule pinned to commit
+`5a37a66dc5d3fbe0ef3cdbeda923a757440f984f`.  Its MIT license and copyright
+notices remain in the submodule.
