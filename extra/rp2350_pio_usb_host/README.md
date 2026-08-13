@@ -8,7 +8,7 @@ The design deliberately separates responsibilities:
 
 - core 1 owns the timing-sensitive PIO USB transport and runs entirely from
   SRAM;
-- core 0 keeps the native USB Zeptoforth console and will own enumeration,
+- core 0 keeps the native USB Zeptoforth console and owns enumeration,
   descriptor parsing, and USB class policy;
 - runtime requests and results cross a fixed shared-SRAM mailbox.  The SIO FIFO
   is used only for the RP2350 core-launch handshake, and its IRQ is disabled
@@ -16,7 +16,11 @@ The design deliberately separates responsibilities:
 
 This is research code, not yet a general USB host implementation.
 
-## Verified descriptor-smoke milestone
+The current sources implement ABI v3.  The earlier ABI-v2 descriptor smoke is
+retained below as a reproducible historical checkpoint; it should not be mixed
+with the current image or helper.
+
+## Verified ABI-v2 descriptor-smoke checkpoint
 
 The ABI v2 image implements one bounded command: a 50 ms bus reset followed by
 a request for the first eight bytes of the device descriptor.  On 2026-08-13,
@@ -41,6 +45,43 @@ SHA256:  42875e20f468b57b13ce0578756ea5603b5fb581622bd0c6f3543c97b7de2a94
 
 The ELF SHA may vary with debug paths and metadata.  The loadable BIN hash
 identifies the exact artifact used for this checkpoint.
+The matching ABI-v2 sources are preserved in commit `87436954`; that artifact
+and `descriptor_smoke.fs` must not be mixed with the current ABI-v3 sources.
+
+## Verified generic-control milestone
+
+ABI v3 replaces the scripted descriptor command with two bounded transport
+operations: `PORT_RESET` and a generic USB control transfer.  Core 1 owns the
+SETUP, optional DATA, and STATUS stages; Forth on core 0 supplies the request
+and owns enumeration policy.  The fixed mailbox advertises a 256-byte control
+buffer and rejects stale port epochs, invalid addresses, endpoint-zero packet
+sizes, and oversized requests before changing bus state.
+
+On 2026-08-14, the ABI-v3 image was loaded into SRAM and read back byte for
+byte on a Cytron MOTION 2350 Pro.  With a directly attached BleuIO dongle,
+Forth issued `PORT_RESET` followed by the generic control request
+`80 06 00 01 00 00 08 00`.  It returned the same device-descriptor prefix:
+
+```text
+12 01 00 02 02 02 00 08
+```
+
+The completion status was `OK`, the actual length was 8, the endpoint complete
+mask was 1, and the error, stall, failure-detail, and core-fault fields were all
+zero.  The native USB Forth console remained responsive and the core 1
+heartbeat continued to advance.
+
+Current reference runtime artifact:
+
+```text
+core1_pio_usb.bin
+size:    17664 bytes (0x4500)
+SHA256:  07f806f909f31a7c17d748bea87ac453b222c7b0a8a93a98b67f121cce8e3308
+```
+
+This proves the generic endpoint-zero transport on the current Cytron/BleuIO
+setup.  Complete device enumeration and CDC/ACM operation are not implemented
+yet.
 
 ## Hardware and resource contract
 
@@ -60,7 +101,7 @@ The hardware preflight detects enabled SM0-SM2 and an actively busy DMA0.  It
 cannot detect an idle software claim, SM3 use, or existing PIO instructions.
 Start only from a clean reset where no other PIO or DMA code has run.
 
-## SRAM layout
+## Current ABI-v3 SRAM layout
 
 `src/rp2350_1core/config.s` lowers Zeptoforth's `ram_end` to `0x20060000`.
 The upper 136 KiB is reserved for the freestanding image:
@@ -70,9 +111,9 @@ Zeptoforth RAM end:  0x20060000
 core 1 reservation: 0x20060000..0x20082000
 vector table:        0x20060000
 entry instruction:   0x200604c0
-initialized copy:    0x20060000..0x2006429c
-BSS:                 0x200642a0..0x20065cf4
-shared ABI:          0x20065d00..0x20065d80
+initialized copy:    0x20060000..0x20064500
+BSS:                 0x20064500..0x20065f74
+shared ABI:          0x20080e00..0x20081000
 core 1 stack:        0x20081000..0x20082000
 ```
 
@@ -127,13 +168,14 @@ The small original heartbeat-only image remains available with:
 make -C extra/rp2350_pio_usb_host inspect
 ```
 
-The address block above and `descriptor_smoke.fs` are pinned to the reference
-BIN hash.  Any rebuild that changes its hash must re-derive `core1_entry`,
-`__core1_copy_end`, `core1_shared`, and `__core1_shared_end`; do not assume
-that `.shared` stays fixed after private BSS changes.  Before running any new
-artifact, verify those symbols, confirm that it has no undefined symbols or
-relocations, and check that every allocatable/loadable section lies inside the
-reserved SRAM range:
+The address block above and `enumeration_v3.fs` are pinned to the current
+ABI-v3 BIN hash.  `descriptor_smoke.fs` is instead pinned to the historical
+ABI-v2 artifact and must not be used with ABI v3.  Any rebuild that changes the
+current hash must re-derive and verify `core1_entry`, `__core1_copy_end`,
+`core1_shared`, and `__core1_shared_end`; the linker must fail rather than move
+or resize the fixed `0x20080e00..0x20081000` mailbox.  Before running a new
+artifact, confirm that it has no undefined symbols or relocations and that
+every allocatable/loadable section lies inside the reserved SRAM range:
 
 ```sh
 arm-none-eabi-nm -u extra/rp2350_pio_usb_host/build/core1_pio_usb.elf
@@ -142,7 +184,40 @@ arm-none-eabi-readelf -l -r \
   extra/rp2350_pio_usb_host/build/core1_pio_usb.elf
 ```
 
-## Running the checkpoint
+## Running the current ABI-v3 checkpoint
+
+The image is a raw SRAM payload, not firmware that can be flashed by itself.
+`enumeration_v3.fs` only defines words; loading the file does not launch core 1,
+reset the port, or contact a USB device.
+
+The safe sequence is:
+
+1. Reset into the carved `rp2350_1core` Zeptoforth baseline.
+2. Confirm `ram-end` is `0x20060000`.
+3. Load the matching 17664-byte BIN at `0x20060000` while both cores are
+   stopped, read back through `0x20064500`, and require the SHA above.
+4. Load `enumeration_v3.fs` over the native USB console.
+5. Invoke `launch-pio-usb-core1-v3` exactly once.
+6. Require ABI 3, phase 4, a changing heartbeat, `fault=0`,
+   `connected=1`, `full-speed=1`, and no resource conflict.
+7. Only then issue the bounded reset and generic control-transfer smoke.
+
+The exact first milestone can be displayed with:
+
+```forth
+: show-v3-smoke
+  pio-usb-get-device-descriptor-8-v3
+  0 do dup i + c@ h.2 space loop drop
+;
+show-v3-smoke
+```
+
+The expected bytes are `12 01 00 02 02 02 00 08`.  Do not publish a second
+command after a timeout or stopped heartbeat; reset the complete target first.
+The next development step is Forth-owned address assignment and complete
+device/configuration descriptor enumeration using the same generic transport.
+
+## Running the historical ABI-v2 checkpoint
 
 The image is a raw SRAM payload, not firmware that can be flashed by itself.
 The exact interactive helper words and ABI offsets are in

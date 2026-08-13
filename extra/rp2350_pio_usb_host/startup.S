@@ -3,6 +3,8 @@
 .thumb
 
 .extern __core1_bss_start
+.extern __core1_bss_end
+.extern __core1_shared_start
 .extern __core1_shared_end
 .extern __core1_stack_top
 .extern core1_main
@@ -24,8 +26,7 @@ core1_vectors:
 .global core1_entry
 core1_entry:
     ldr r0, =__core1_bss_start
-    /* Clear both private BSS and the NOLOAD telemetry block. */
-    ldr r1, =__core1_shared_end
+    ldr r1, =__core1_bss_end
     movs r2, #0
 1:
     cmp r0, r1
@@ -33,6 +34,15 @@ core1_entry:
     str r2, [r0], #4
     b 1b
 2:
+    /* The fixed mailbox is intentionally separated from private BSS. */
+    ldr r0, =__core1_shared_start
+    ldr r1, =__core1_shared_end
+3:
+    cmp r0, r1
+    bcs 4f
+    str r2, [r0], #4
+    b 3b
+4:
     dsb
     isb
     bl core1_main

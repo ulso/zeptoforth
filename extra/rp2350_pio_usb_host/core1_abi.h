@@ -4,7 +4,9 @@
 #include <stdint.h>
 
 #define CORE1_ABI_MAGIC 0x43505531u /* "CPU1" */
-#define CORE1_ABI_VERSION 2u
+#define CORE1_ABI_VERSION 3u
+#define CORE1_ABI_BYTES 512u
+#define CORE1_CONTROL_DATA_CAPACITY 256u
 
 enum {
     CORE1_IMAGE_SMOKE = 1,
@@ -12,8 +14,22 @@ enum {
 };
 
 enum {
+    CORE1_CAP_PORT_RESET = 1u << 0,
+    CORE1_CAP_CONTROL_TRANSFER = 1u << 1,
+};
+
+enum {
+    CORE1_PORT_DETACHED = 0,
+    CORE1_PORT_ATTACHED_SUSPENDED = 1,
+    CORE1_PORT_ACTIVE = 2,
+    CORE1_PORT_RESETTING = 3,
+    CORE1_PORT_RECOVERY_REQUIRED = 4,
+};
+
+enum {
     CORE1_COMMAND_NONE = 0,
-    CORE1_COMMAND_GET_DEVICE_DESCRIPTOR_8 = 1,
+    CORE1_COMMAND_PORT_RESET = 1,
+    CORE1_COMMAND_CONTROL_TRANSFER = 2,
 };
 
 enum {
@@ -21,8 +37,10 @@ enum {
     CORE1_COMMAND_BUSY = 1,
     CORE1_COMMAND_OK = 2,
     CORE1_COMMAND_ERROR_INVALID = 0x80,
+    CORE1_COMMAND_ERROR_STALE_EPOCH,
     CORE1_COMMAND_ERROR_NOT_CONNECTED,
     CORE1_COMMAND_ERROR_NOT_FULL_SPEED,
+    CORE1_COMMAND_ERROR_PORT_STATE,
     CORE1_COMMAND_ERROR_ENDPOINT_OPEN,
     CORE1_COMMAND_ERROR_SETUP_START,
     CORE1_COMMAND_ERROR_DATA_START,
@@ -31,7 +49,6 @@ enum {
     CORE1_COMMAND_ERROR_STALL,
     CORE1_COMMAND_ERROR_TIMEOUT,
     CORE1_COMMAND_ERROR_DISCONNECT,
-    CORE1_COMMAND_ERROR_DESCRIPTOR,
 };
 
 enum {
@@ -46,6 +63,7 @@ enum {
 };
 
 typedef struct {
+    /* Core 1 telemetry.  Keep fault at offset 0x14 for startup.S. */
     volatile uint32_t magic;
     volatile uint32_t abi_version;
     volatile uint32_t image_kind;
@@ -65,37 +83,57 @@ typedef struct {
     volatile uint32_t pio_ctrl;
     volatile uint32_t dma_ctrl;
 
-    /* Single-writer mailbox.  Core 0 writes command then publishes a new
-     * command_seq.  Core 1 publishes all result fields before completion_seq.
-     */
-    volatile uint32_t command_seq;
+    volatile uint32_t abi_bytes;
+    volatile uint32_t capabilities;
+    volatile uint32_t data_capacity;
+    volatile uint32_t port_epoch;
+    volatile uint32_t port_state;
+
+    /* Single-writer request.  Core 0 writes every request field and any OUT
+     * payload, executes DMB, then publishes request_seq last. */
+    volatile uint32_t request_seq;
     volatile uint32_t command;
+    volatile uint32_t request_epoch;
+    volatile uint32_t device_address;
+    volatile uint32_t ep0_mps;
+    volatile uint32_t transfer_length;
+    volatile uint8_t setup[8];
+
+    /* Single-writer response.  Core 1 writes every response field and any IN
+     * payload, executes DMB, then publishes completion_seq last. */
     volatile uint32_t completion_seq;
     volatile uint32_t command_status;
     volatile uint32_t command_phase;
+    volatile uint32_t completion_epoch;
+    volatile uint32_t actual_length;
+    volatile uint32_t completion_frame;
     volatile uint32_t command_deadline_frame;
-    volatile uint32_t descriptor_length;
     volatile uint32_t endpoint_complete;
     volatile uint32_t endpoint_error;
     volatile uint32_t endpoint_stalled;
-    volatile uint8_t descriptor[16];
+    volatile uint32_t failure_detail;
+
+    volatile uint32_t reserved[(0x100u - 0xa8u) / sizeof(uint32_t)];
+    volatile uint8_t data[CORE1_CONTROL_DATA_CAPACITY];
 } core1_shared_t;
 
-_Static_assert(sizeof(core1_shared_t) == 128,
-               "core 1 mailbox ABI must remain exactly 128 bytes");
+_Static_assert(sizeof(core1_shared_t) == CORE1_ABI_BYTES,
+               "core 1 mailbox ABI size changed");
 _Static_assert(offsetof(core1_shared_t, fault) == 0x14,
                "the assembly fault-vector ABI changed");
-_Static_assert(offsetof(core1_shared_t, command_seq) == 0x48,
+_Static_assert(offsetof(core1_shared_t, abi_bytes) == 0x48,
+               "the ABI metadata offset changed");
+_Static_assert(offsetof(core1_shared_t, port_epoch) == 0x54,
+               "the port epoch offset changed");
+_Static_assert(offsetof(core1_shared_t, request_seq) == 0x5c,
                "the core 0 request sequence offset changed");
-_Static_assert(offsetof(core1_shared_t, command) == 0x4c,
-               "the core 0 command offset changed");
-_Static_assert(offsetof(core1_shared_t, completion_seq) == 0x50,
+_Static_assert(offsetof(core1_shared_t, setup) == 0x74,
+               "the setup packet offset changed");
+_Static_assert(offsetof(core1_shared_t, completion_seq) == 0x7c,
                "the core 1 response sequence offset changed");
-_Static_assert(offsetof(core1_shared_t, command_status) == 0x54,
-               "the command status offset changed");
-_Static_assert(offsetof(core1_shared_t, descriptor_length) == 0x60,
-               "the descriptor length offset changed");
-_Static_assert(offsetof(core1_shared_t, descriptor) == 0x70,
-               "the descriptor payload offset changed");
+_Static_assert(offsetof(core1_shared_t, actual_length) == 0x8c,
+               "the actual length offset changed");
+_Static_assert(offsetof(core1_shared_t, data) == 0x100,
+               "the control data offset changed");
 
 extern core1_shared_t core1_shared;

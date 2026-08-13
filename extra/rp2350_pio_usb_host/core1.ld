@@ -9,6 +9,7 @@ PHDRS
 {
     code PT_LOAD FLAGS(5); /* read + execute */
     data PT_LOAD FLAGS(6); /* read + write */
+    shared PT_LOAD FLAGS(6); /* fixed NOLOAD core 0/core 1 mailbox */
 }
 
 SECTIONS
@@ -48,14 +49,13 @@ SECTIONS
         __core1_bss_end = .;
     } > CORE1_RAM :data
 
-    .shared (NOLOAD) :
+    .shared 0x20080e00 (NOLOAD) :
     {
-        . = ALIGN(16);
         __core1_shared_start = .;
         KEEP(*(.shared*))
         . = ALIGN(16);
         __core1_shared_end = .;
-    } > CORE1_RAM :data
+    } > CORE1_RAM :shared
 
     __core1_image_end = .;
     __core1_stack_top = ORIGIN(CORE1_RAM) + LENGTH(CORE1_RAM);
@@ -63,6 +63,14 @@ SECTIONS
 
     ASSERT(__core1_image_end <= __core1_stack_limit,
            "core 1 image overlaps its 4 KiB stack")
+    ASSERT(__core1_bss_end <= __core1_shared_start,
+           "core 1 private BSS overlaps the fixed shared mailbox")
+    ASSERT(__core1_shared_start == 0x20080e00,
+           "core 1 shared mailbox moved")
+    ASSERT(SIZEOF(.shared) == 0x200,
+           "core 1 shared mailbox must remain exactly 512 bytes")
+    ASSERT(__core1_shared_end == __core1_stack_limit,
+           "core 1 shared mailbox must end at the stack limit")
     ASSERT((__core1_vectors & 0x1ff) == 0,
            "core 1 vector table is not 512-byte aligned")
 
