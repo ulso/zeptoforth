@@ -448,6 +448,104 @@ variable cdc-acm-v4-scan-in-interval
   averts x-cdc-acm-v4-not-open
 ;
 
+\ Execute a higher-level CDC transaction while exclusively owning both the
+\ class/session lock and the one ABI-v4 mailbox lock.  The supplied xt may use
+\ only CDC words documented as *-unlocked; calling a public CDC operation from
+\ it would recursively claim these non-blocking locks and fail.
+\
+\ Catching a host-side mailbox wait timeout here is essential.  Such a timeout
+\ leaves publication/completion ownership unknown, so invalidate the local
+\ session and latch the mailbox unusable before either lock is released.
+: execute-cdc-acm-v4-transaction-unlocked ( xt -- )
+  require-cdc-acm-v4-mailbox-usable
+  try { exception }
+  exception cdc-acm-v4-terminal-timeout? if
+    invalidate-cdc-acm-v4-after-timeout
+  then
+  exception ?raise
+;
+
+: cdc-acm-v4-transaction-with-command-lock ( xt -- )
+  ['] execute-cdc-acm-v4-transaction-unlocked
+  with-pio-usb-v4-command-lock
+;
+
+: with-cdc-acm-v4-transaction ( xt -- )
+  ['] cdc-acm-v4-transaction-with-command-lock
+  with-cdc-acm-v4-lock
+;
+
+: require-cdc-acm-v4-transfer-timeout ( timeout-frames -- )
+  dup 0>
+  swap pio-usb-v4-endpoint-timeout-max-frames u<= and
+  averts x-pio-usb-v4-invalid-argument
+;
+
+\ Write the complete caller-owned byte range.  One mailbox publication can
+\ carry at most 256 bytes; longer ranges are split, and a PARTIAL completion is
+\ resumed without losing the endpoint's transport-owned data toggle.  The
+\ timeout applies independently to each bounded publication.  A transport
+\ timeout with no progress cannot satisfy write-all and is reported as a CDC
+\ transfer failure (unlike the terminal host-side wait timeout latched above).
+: cdc-acm-v4-write-all-unlocked
+  { data length timeout-frames -- }
+  require-cdc-acm-v4-open
+  timeout-frames require-cdc-acm-v4-transfer-timeout
+  begin length 0> while
+    length pio-usb-v4-control-data-size min { requested }
+    data requested
+    cdc-acm-v4-address @ cdc-acm-v4-bulk-out-endpoint @
+    timeout-frames
+    pio-usb-endpoint-out-v4-unlocked { actual status }
+    status pio-usb-v4-command-ok =
+    status pio-usb-v4-command-partial = or
+    actual 0> and
+    actual requested u<= and
+    averts x-cdc-acm-v4-transfer-failed
+    actual +to data
+    actual negate +to length
+  repeat
+;
+
+\ Perform one bounded IN publication and copy its ephemeral shared-buffer data
+\ before returning.  At most min(capacity, 256) bytes are requested.  A normal
+\ endpoint no-data timeout returns zero; OK/PARTIAL data returns its copied byte
+\ count.  This word never exposes pio-usb-v4-data to its caller.
+: cdc-acm-v4-read-unlocked
+  { destination capacity timeout-frames -- received }
+  require-cdc-acm-v4-open
+  timeout-frames require-cdc-acm-v4-transfer-timeout
+  capacity 0= if 0 exit then
+  capacity pio-usb-v4-control-data-size min { requested }
+  cdc-acm-v4-address @ cdc-acm-v4-bulk-in-endpoint @
+  requested timeout-frames
+  pio-usb-endpoint-in-v4-unlocked { data actual status }
+  status pio-usb-v4-command-error-timeout = if
+    actual 0= averts x-cdc-acm-v4-transfer-failed
+    0 exit
+  then
+  status pio-usb-v4-command-ok =
+  status pio-usb-v4-command-partial = or
+  actual requested u<= and
+  averts x-cdc-acm-v4-transfer-failed
+  data destination actual move
+  actual
+;
+
+\ Stand-alone convenience entry points.  A higher-level protocol operation
+\ that needs several writes/reads atomically should instead call the unlocked
+\ words from one with-cdc-acm-v4-transaction quotation.
+: cdc-acm-v4-write-all ( data length timeout-frames -- )
+  ['] cdc-acm-v4-write-all-unlocked
+  with-cdc-acm-v4-transaction
+;
+
+: cdc-acm-v4-read
+  ( destination capacity timeout-frames -- received )
+  ['] cdc-acm-v4-read-unlocked
+  with-cdc-acm-v4-transaction
+;
+
 : close-cdc-acm-v4-in-unlocked ( -- )
   cdc-acm-v4-address @ cdc-acm-v4-bulk-in-endpoint @
   pio-usb-endpoint-close-v4-unlocked

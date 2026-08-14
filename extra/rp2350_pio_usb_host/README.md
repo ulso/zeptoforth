@@ -145,6 +145,43 @@ exchange succeeded without reopening the endpoints.  Explicit close followed
 by reopen also succeeded.  Throughout the run, the native Zeptoforth USB CDC
 console remained responsive and core 1 reported `fault = 0`.
 
+The current `cdc_acm_v4.fs` also exposes bounded, serialized byte-stream
+operations for higher protocol layers:
+
+- `cdc-acm-v4-write-all` splits arbitrary caller buffers into mailbox-sized
+  transfers and safely resumes partial OUT completions;
+- `cdc-acm-v4-read` performs one bounded IN poll and copies data out of the
+  ephemeral shared mailbox before releasing its locks; and
+- `with-cdc-acm-v4-transaction` lets one higher-level operation own the CDC
+  class and ABI mailbox continuously across a write and its response reads.
+
+## Verified current BleuIO Forth command milestone
+
+`bleuio.fs` is a definitions-only Forth module built on the generic CDC byte
+stream.  It adds bounded CRLF framing, optional echo handling, the BleuIO
+verbose `C`/`A`/`R`/`E` response protocol, raw-response retention, numeric
+BleuIO error reporting, and atomic command/bootstrap/lifecycle operations.
+Loading the file performs no USB I/O.
+
+On 2026-08-14, the module was compiled on the running Cytron target without
+reloading the already verified core-1 image or descriptor state.  Its atomic
+bootstrap successfully issued `ATV1`, `ATE0`, `ATA0`, `ATEW0`, and `ATDS0`.
+`ATI` then identified the attached device as a BleuIO Pro running firmware
+`1.0.5.6`, and `AT+GAPSTATUS` reported the dual GAP role.  Both responses had
+matching command indices and `A.err = 0`.
+
+An intentionally invalid command returned `false`, retained BleuIO error 7
+(`Invalid command or wrong argument count`), and did not lose stream
+synchronization.  A subsequent `AT` succeeded.  `bleuio::close` then closed
+both bulk endpoints; the ABI mailbox was idle, core 1 remained alive, and
+`fault`, CDC terminal-timeout, and BleuIO resync-required were all zero.
+
+This first BleuIO layer is deliberately synchronous.  It does not yet retain
+asynchronous scan events or run a receive task.  If a transport/framing timeout
+makes command boundaries uncertain, `resync-required?` latches true across
+ordinary close/open.  Do not publish another command; reset the target, reload
+the matching helpers, and enumerate again.
+
 Current reference runtime artifact:
 
 ```text
@@ -258,10 +295,10 @@ arm-none-eabi-readelf -l -r \
 ## Running the current ABI-v4 checkpoint
 
 The image is a raw SRAM payload, not firmware that can be flashed by itself.
-`enumeration_v4.fs`, `full_enumeration_v4.fs`, and `cdc_acm_v4.fs` only define
-words and initialize RAM-local helper state.  Loading them does not launch core
-1, reset the port, enumerate a device, issue a class request, or open an
-endpoint.
+`enumeration_v4.fs`, `full_enumeration_v4.fs`, `cdc_acm_v4.fs`, and
+`bleuio.fs` only define words and initialize RAM-local helper state.  Loading
+them does not launch core 1, reset the port, enumerate a device, issue a class
+request, or open an endpoint.
 
 The safe sequence is:
 
@@ -270,7 +307,8 @@ The safe sequence is:
 3. Load the matching 19120-byte BIN at `0x20060000` while both cores are
    stopped, read back through `0x20064ab0`, and require the SHA above.
 4. Load `enumeration_v4.fs`, `full_enumeration_v4.fs`, and `cdc_acm_v4.fs`, in
-   that order, over the native USB console.
+   that order, over the native USB console.  Load `bleuio.fs` afterward if the
+   high-level BleuIO command API is wanted.
 5. Invoke `launch-pio-usb-core1-v4` exactly once.
 6. Require ABI 4, phase 4, a changing heartbeat, `fault=0`,
    `connected=1`, `full-speed=1`, and no resource conflict.
@@ -311,6 +349,25 @@ and normalized interface/endpoint records can be inspected without reusing the
 shared control buffer.  The CDC helper leaves the interrupt notification
 endpoint closed; its smoke sends exactly `41 54 0D 0A` and requires a complete
 `OK\r\n` response line within bounded polls and a 256-byte local buffer.
+
+With `bleuio.fs` loaded, the verified high-level sequence is:
+
+```forth
+bleuio::open .                 \ true on successful CDC open and bootstrap
+bleuio::bootstrap-complete? .  \ true
+bleuio::ati .                  \ true
+bleuio::.response
+bleuio::gap-status .           \ true
+bleuio::.response
+bleuio::close
+```
+
+`bleuio::command ( data length -- success? )` accepts a command without CR or
+LF and appends CRLF itself.  Protocol-level `ERROR` or a nonzero verbose
+`A.err` returns false and leaves the raw response, `result@`, and
+`error-code@` available for inspection.  Transport, framing, timeout, and
+capacity failures raise.  The convenience words currently include `at`,
+`ati`, `central`, `peripheral`, and `gap-status`.
 
 Two different timeout cases must not be confused.  A completed endpoint IN
 request with USB transfer status `TIMEOUT` (`0x8B`) and actual length 0 is a
@@ -379,7 +436,10 @@ control, hot-plug policy above the core-1 transport, or CDC notification
 handling.  The class helper intentionally accepts only a validated CDC ACM
 control interface with one Union-linked alternate-zero data interface and
 exactly one bulk IN plus one bulk OUT endpoint.  General multi-device and
-multi-class policy remains future work.
+multi-class policy remains future work.  The BleuIO module is presently a
+synchronous request/response layer; background scanning, unsolicited-event
+retention, and a broader JavaScript-library-equivalent command vocabulary are
+future layers.
 
 ## Upstream
 
