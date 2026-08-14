@@ -15,7 +15,11 @@
 \ pio-usb-v4-enumeration-complete? returns true.  A failed attempt leaves the
 \ stage and exception variables set, but clears the complete flag.
 
-compile-to-ram
+defined? pio-usb-host-persistent-build [if]
+  compile-to-flash
+[else]
+  compile-to-ram
+[then]
 
 \ Standard USB requests and descriptor types used by this milestone.
 $05 constant pio-usb-v4-request-set-address
@@ -481,4 +485,8 @@ buffer: pio-usb-v4-endpoint-records
 ;
 
 \ Initialize only RAM-local diagnostics; no USB or core-1 action is performed.
-clear-pio-usb-v4-enumeration-diagnostics
+: init-pio-usb-v4-enumeration-diagnostics ( -- )
+  clear-pio-usb-v4-enumeration-diagnostics
+;
+
+initializer init-pio-usb-v4-enumeration-diagnostics

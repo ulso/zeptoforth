@@ -9,7 +9,11 @@
 \ Additional records are drained and counted.  The most recent unclassified
 \ line and the matching SE line are retained separately for diagnostics.
 
-compile-to-ram
+defined? pio-usb-host-persistent-build [if]
+  compile-to-flash
+[else]
+  compile-to-ram
+[then]
 
 continue-module bleuio
 
@@ -478,8 +482,12 @@ continue-module bleuio
     scan-timed-out @ if ." [BleuIO scan exceeded its host deadline]" cr then
   ;
 
-  false scan-running !
-  clear-scan-storage
-  $03 scan-etx-buffer c!
+  : init-bleuio-scan-state ( -- )
+    false scan-running !
+    clear-scan-storage
+    $03 scan-etx-buffer c!
+  ;
+
+  initializer init-bleuio-scan-state
 
 end-module

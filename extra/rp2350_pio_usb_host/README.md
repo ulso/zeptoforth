@@ -223,6 +223,126 @@ size:    19120 bytes (0x4ab0)
 SHA256:  637f9b88b15b344a2147203eaa373d571224c6ff1eaa4e56d215fa9d780f50cf
 ```
 
+## Verified self-contained Cytron UF2 preview
+
+The Cytron MOTION 2350 Pro no longer needs a debugger load after every reset.
+The preview firmware embeds the audited ABI-v4 core-1 payload and all current
+Forth layers in flash.  Its final boot initializer validates the platform and
+embedded SHA-256, reserves all of PIO0 plus DMA0, clears the carved SRAM,
+copies and verifies the payload, and launches core 1.  Native USB remains the
+Zeptoforth console on core 0.
+
+Autostart deliberately stops at the transport boundary.  It does not reset
+the USB-A port, enumerate a device, open CDC, issue an AT command, or start a
+scan.  Those remain explicit Forth operations after the prompt appears.
+
+The complete 2 MiB flash image and its UF2 export were verified on 2026-08-14:
+
+```text
+zeptoforth-cytron-motion-2350-pro-pio-usb-host-1.16.5.bin
+size:    2097152 bytes
+SHA256:  fe2aa1d37c2ce2e690567899c8718de551f3139da748c8a88030ab67887572e3
+
+zeptoforth-cytron-motion-2350-pro-pio-usb-host-1.16.5.uf2
+size:    4194304 bytes
+SHA256:  8fd1f5f311cedcc7cf6d177b9cceb728cd942d55ac665f74556cf7f5e6380c5b
+```
+
+The UF2 contains 8192 consecutive 256-byte payload blocks covering exactly
+`0x10000000..0x10200000`, with RP2350 ARM Secure family ID `0xE48BFF59`.
+Reassembling those blocks produces the BIN hash above byte for byte.
+
+The UF2 was flashed back with verification and booted twice without a debugger
+SRAM load.  The first boot reported:
+
+```text
+autostart-ok=-1 status=5 exception=0 resources-reserved=-1
+running=-1 alive=-1 fault=0
+FINAL_CDC_OWNER_SMOKE=PASS cycles=6 scans=1 epoch=3
+```
+
+After a second Zeptoforth reboot, a test using only persistent words enumerated
+address 1, configuration 1, VID:PID `2DCF:6002`, then completed
+`bleuio::open`, `AT`, a one-second GAP scan, another `AT`, and logical close.
+Core 1 remained alive and `fault` remained zero.
+
+### Flashing the preview
+
+This image is only for the 2 MiB Cytron MOTION 2350 Pro with USB host D+/D-
+on GP24/GP25.  Do not flash it on another RP2350 board.
+
+Verify the downloaded artifact, enter BOOTSEL by holding the board's BOOT
+button during reset (or enter `bootsel` at a working Zeptoforth prompt), then
+either drag the UF2 onto the `RP2350` volume or use:
+
+```sh
+shasum -a 256 \
+  zeptoforth-cytron-motion-2350-pro-pio-usb-host-1.16.5.uf2
+
+picotool load --ignore-partitions -v -x \
+  zeptoforth-cytron-motion-2350-pro-pio-usb-host-1.16.5.uf2 \
+  -t uf2
+```
+
+No debug probe is needed for normal use.  After native USB CDC appears, check
+the boot transport and explicitly enumerate the attached BleuIO:
+
+```forth
+pio-usb-core1-v4-autostart.
+pio-usb-core1-v4-autostart-ok? .  \ -1
+pio-usb-core1-v4-alive? .         \ -1
+pio-usb-v4-fault @ .              \ 0
+
+hex pio-usb-enumerate-root-control-v4 .s decimal
+\ expected stack for BleuIO: 1 1 2DCF 6002
+
+bleuio::open .                    \ -1
+bleuio::at .                      \ -1
+1 bleuio::gap-scan .              \ -1
+bleuio::.scan-results
+bleuio::at .                      \ -1
+bleuio::close
+```
+
+This is a developer preview.  In particular, do not invoke the global `init`
+word while core 1 is running: earlier initializers can reset resource-pool
+bookkeeping before the autostart guard runs.  Use `reboot`, the reset button,
+or a complete power cycle instead.  If autostart validation fails, if the
+heartbeat stops, or if a terminal mailbox timeout occurs, do not retry in the
+same boot.  Reset the complete target.  BOOTSEL remains the unconditional
+recovery path for reflashing this image or a stock Zeptoforth UF2.
+
+### Building the persistent extension
+
+The generated payload source is intentionally not versioned.  A fresh checkout
+must first reproduce the pinned core-1 BIN, then generate its flash-dictionary
+representation:
+
+```sh
+git submodule update --init extra/rp2350_pio_usb_host/Pico-PIO-USB
+
+env PICO_SDK_PATH=/path/to/pico-sdk \
+  cmake -S extra/rp2350_pio_usb_host \
+        -B extra/rp2350_pio_usb_host/build \
+        -DPICO_PLATFORM=rp2350-arm-s \
+        -DPICO_BOARD=pico2 \
+        -DCMAKE_BUILD_TYPE=MinSizeRel
+
+cmake --build extra/rp2350_pio_usb_host/build --target core1_pio_usb
+
+python3 extra/rp2350_pio_usb_host/generate_core1_payload.py \
+  extra/rp2350_pio_usb_host/build/core1_pio_usb.bin \
+  extra/rp2350_pio_usb_host/generated/core1_payload_v4.fs
+```
+
+The generator refuses any input whose size or SHA-256 differs from the audited
+19120-byte ABI-v4 payload.  On an `rp2350_1core` system that already has
+`setup_full_usb.fs` in flash, load
+`extra/rp2350_pio_usb_host/install_cytron_motion_2350_pro.fs` and reboot.  For
+the normal Zeptoforth live-image build flow, the combined setup entry point is
+`src/rp2350_1core/forth/setup_full_usb_pio_host.fs`.  Both paths install the
+same dependency-ordered initializers and save an updated mini-dictionary.
+
 ## Hardware and resource contract
 
 The current image assumes:
@@ -261,10 +381,12 @@ All executable code, constants, mutable data, vectors, and the stack must stay
 in this SRAM region.  Core 1 must never call or read QSPI/XIP while core 0 may
 write the Forth flash dictionary.
 
-## Parent Zeptoforth prerequisite
+## Parent Zeptoforth prerequisite for the manual development path
 
-The core 1 payload is only safe with the carved `rp2350_1core` parent built
-from this branch.  Build and flash that baseline before loading the SRAM image:
+The distributed self-contained UF2 already includes this parent.  When using
+the manual SRAM development path, the core 1 payload is only safe with the
+carved `rp2350_1core` parent built from this branch.  Build and flash that
+baseline before loading the SRAM image:
 
 ```sh
 make rp2350_1core
@@ -325,9 +447,11 @@ arm-none-eabi-readelf -l -r \
   extra/rp2350_pio_usb_host/build/core1_pio_usb.elf
 ```
 
-## Running the current ABI-v4 checkpoint
+## Manual SRAM development path for ABI v4
 
-The image is a raw SRAM payload, not firmware that can be flashed by itself.
+This section is retained for developing or replacing the core-1 transport.  It
+is not required when using the self-contained Cytron UF2 above.  In this path,
+the image is a raw SRAM payload, not firmware that can be flashed by itself.
 `enumeration_v4.fs`, `full_enumeration_v4.fs`, `cdc_acm_v4.fs`, and
 `bleuio.fs` only define words and initialize RAM-local helper state.  Loading
 them does not launch core 1, reset the port, enumerate a device, issue a class

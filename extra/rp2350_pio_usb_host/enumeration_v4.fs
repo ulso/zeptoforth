@@ -21,7 +21,11 @@
 \ * Every public mailbox command takes one global non-blocking simple lock.
 \   Words ending in -unlocked are for a caller already holding that lock.
 
-compile-to-ram
+defined? pio-usb-host-persistent-build [if]
+  compile-to-flash
+[else]
+  compile-to-ram
+[then]
 
 core1 import
 interrupt import
@@ -150,7 +154,6 @@ $80 constant pio-usb-v4-command-phase-error
 100 constant pio-usb-v4-endpoint-response-grace-ms
 
 variable pio-usb-core1-v4-launched
-false pio-usb-core1-v4-launched !
 slock-size buffer: pio-usb-v4-command-slock
 
 : x-pio-usb-core1-v4-image-missing ( -- )
@@ -687,4 +690,13 @@ slock-size buffer: pio-usb-v4-command-slock
 ;
 
 \ Initialize only RAM-local serialization state; no mailbox command is sent.
-pio-usb-v4-command-slock init-slock
+\ `initializer` executes this immediately for an ordinary RAM load and chains
+\ it into `init` when this file is included in a persistent firmware image.
+: init-pio-usb-v4-command-state ( -- )
+  pio-usb-core1-v4-alive? 0= if
+    false pio-usb-core1-v4-launched !
+  then
+  pio-usb-v4-command-slock init-slock
+;
+
+initializer init-pio-usb-v4-command-state

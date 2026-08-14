@@ -17,7 +17,11 @@
 \ This first milestone is deliberately synchronous.  It does not start a
 \ scan, retain asynchronous events, or create a background receive task.
 
-compile-to-ram
+defined? pio-usb-host-persistent-build [if]
+  compile-to-flash
+[else]
+  compile-to-ram
+[then]
 
 begin-module bleuio
 
@@ -476,10 +480,14 @@ begin-module bleuio
     ['] execute-close with-command-lock
   ;
 
-  command-slock init-slock
-  false resync-required !
-  false bootstrap-complete !
-  0 command-length !
-  clear-response-state
+  : init-bleuio-state ( -- )
+    command-slock init-slock
+    false resync-required !
+    false bootstrap-complete !
+    0 command-length !
+    clear-response-state
+  ;
+
+  initializer init-bleuio-state
 
 end-module

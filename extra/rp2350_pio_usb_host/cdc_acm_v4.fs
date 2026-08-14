@@ -19,7 +19,11 @@
 \ Shared IN data is copied before another command can publish; no shared-buffer
 \ pointer is retained in class state.
 
-compile-to-ram
+defined? pio-usb-host-persistent-build [if]
+  compile-to-flash
+[else]
+  compile-to-ram
+[then]
 
 slock import
 
@@ -861,7 +865,11 @@ variable cdc-acm-v4-scan-in-interval
 ;
 
 \ Initialize RAM-local serialization and buffers only; no USB action occurs.
-cdc-acm-v4-slock init-slock
-false cdc-acm-v4-terminal-timeout !
-clear-cdc-acm-v4-local-state
-prepare-cdc-acm-v4-static-data
+: init-cdc-acm-v4-state ( -- )
+  cdc-acm-v4-slock init-slock
+  false cdc-acm-v4-terminal-timeout !
+  clear-cdc-acm-v4-local-state
+  prepare-cdc-acm-v4-static-data
+;
+
+initializer init-cdc-acm-v4-state

@@ -1,3 +1,6 @@
 /build/
 /build-cmake/
 /build-smoke/
+/generated/
+/dist/
+__pycache__/
