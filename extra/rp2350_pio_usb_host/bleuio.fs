@@ -460,12 +460,18 @@ begin-module bleuio
   ;
 
   \ Open the descriptor-derived CDC ACM function and apply the BleuIO
-  \ bootstrap.  A protocol ERROR returns false and deliberately leaves CDC
-  \ open so response@ can be inspected and a raw recovery command can be sent.
+  \ bootstrap.  If the physical bulk pipes are retained in the current port
+  \ epoch, reuse them so their host/device data toggles remain continuous, but
+  \ always run the bootstrap again.  A protocol ERROR returns false and
+  \ deliberately leaves CDC logically open so response@ can be inspected and
+  \ a raw recovery command can be sent.
   : open ( -- success? )
     ['] execute-open with-command-lock
   ;
 
+  \ Logically close and quiesce BleuIO.  CDC keeps a complete current pair of
+  \ physical bulk pipes for the next open; detach or an epoch change causes
+  \ that stale local pipe state to be discarded without publishing CLOSE.
   : close ( -- )
     ['] execute-close with-command-lock
   ;

@@ -141,15 +141,32 @@ both with MPS 64.
 Repeated `AT\r\n` transfers returned the optional command echo followed by a
 complete `OK\r\n` line.  An empty bulk-IN poll completed with the nonfatal USB
 transfer status `TIMEOUT` (`0x8B`) and actual length 0; a subsequent `AT`
-exchange succeeded without reopening the endpoints.  Later repeated testing
-showed that a physical close followed by reopen in the same configured USB
-session is not reliable: closing currently discards the host endpoint's data
-toggle while the device retains its toggle.  A reopened IN endpoint can then
-discard the first response packet.  Keep the data endpoints open for the whole
-enumerated port epoch, and close them only at final teardown.  Before another
-open, reset the host port and enumerate again.  Throughout the verified runs,
-the native Zeptoforth USB CDC console remained responsive and core 1 reported
-`fault = 0`.
+exchange succeeded without reopening the endpoints.  A true physical endpoint
+close followed by reopen in the same configured USB session is unsupported: the
+core-1 close discards the host endpoint's data toggle while the device retains
+its toggle.  A reopened IN endpoint can then discard the first response packet.
+
+The current class lifecycle therefore keeps a complete pair of physical bulk
+pipes open for the whole enumerated port epoch.  `close-cdc-acm-v4` is a logical
+quiesce: it clears the logical-open flag and response state but retains both
+pipes and their core-1-owned toggles.  A same-epoch open reuses those pipes;
+`bleuio::close` delegates to the same behavior; neither public close word is a
+physical teardown.  A detach or port reset causes core 1 to discard the pipes
+and advance the port epoch.  The next class lifecycle operation then forgets
+the stale local state without publishing CLOSE against obsolete endpoint
+identities.
+
+This lifecycle passed 101 consecutive cycles of `bleuio::open` (including its
+bootstrap), `AT`, and `bleuio::close` in one port epoch.  One further same-epoch
+open completed a one-second GAP scan, an immediate `AT`, and a final logical
+close.  A duplicate high-level open raised `x-cdc-acm-v4-already-open` without
+disturbing the pipes or the following `AT`.  A separate port-reset test from
+the logically closed retained state discarded stale local state, enumerated
+again, and completed a fresh open/`AT`/close at the new epoch.  After the final
+logical close, `cdc-acm-v4-initialized` was 0 while both endpoint-open flags
+were true (`-1`).  Throughout the runs, the native Zeptoforth USB CDC console
+remained responsive, core 1 remained alive, the mailbox returned idle, resync
+and terminal-timeout remained zero, and core 1 reported `fault = 0`.
 
 The current `cdc_acm_v4.fs` also exposes bounded, serialized byte-stream
 operations for higher protocol layers:
@@ -179,8 +196,9 @@ matching command indices and `A.err = 0`.
 An intentionally invalid command returned `false`, retained BleuIO error 7
 (`Invalid command or wrong argument count`), and did not lose stream
 synchronization.  A subsequent `AT` succeeded.  `bleuio::close` then closed
-both bulk endpoints; the ABI mailbox was idle, core 1 remained alive, and
-`fault`, CDC terminal-timeout, and BleuIO resync-required were all zero.
+the logical BleuIO session while retaining both current bulk pipes.  The ABI
+mailbox was idle, core 1 remained alive, and `fault`, CDC terminal-timeout, and
+BleuIO resync-required were all zero.
 
 `bleuio_scan.fs` extends that same synchronous stream owner with bounded
 `AT+GAPSCAN=<seconds>` collection.  In the hardware acceptance run, a
@@ -329,11 +347,13 @@ The safe sequence is:
 6. Require ABI 4, phase 4, a changing heartbeat, `fault=0`,
    `connected=1`, `full-speed=1`, and no resource conflict.
 7. Run the complete root enumeration.
-8. Open the discovered CDC ACM function once, then run all bounded commands and
-   scans in the same endpoint session.
-9. Close the CDC data endpoints only when completely finished.  With the
-   current transport, reset the host port and enumerate again before a later
-   open; physical close/reopen in one configured port epoch is not supported.
+8. Logically open the discovered CDC ACM function, then run bounded commands
+   and scans.  The physical data pipes remain owned by this enumerated epoch.
+9. Logically close when quiescent.  A later same-epoch open reuses the retained
+   pipes and reruns the BleuIO bootstrap.  Do not invoke
+   `pio-usb-endpoint-close-v4` on these CDC-owned pipes: same-epoch physical
+   close/reopen is unsupported.  Detach or port reset physically discards the
+   pipes; enumerate again before the next fresh open.
 
 The endpoint-zero descriptor smoke remains available with:
 
@@ -385,8 +405,9 @@ LF and appends CRLF itself.  Protocol-level `ERROR` or a nonzero verbose
 capacity failures raise.  The convenience words currently include `at`,
 `ati`, `central`, `peripheral`, and `gap-status`.
 
-With `bleuio_scan.fs` loaded, continue in that same open session to test a
-finite scan, then close only after all work is complete:
+With `bleuio_scan.fs` loaded, run a finite scan while logically open.  The final
+`bleuio::close` below quiesces only the logical session; a later same-epoch
+`bleuio::open` reuses the physical pipes:
 
 ```forth
 2 bleuio::gap-scan .          \ true after a natural two-second scan
@@ -486,7 +507,9 @@ exactly one bulk IN plus one bulk OUT endpoint.  General multi-device and
 multi-class policy remains future work.  The BleuIO module now includes
 bounded synchronous GAP scanning, but not a background receive owner, general
 unsolicited-event retention, or the broader JavaScript-library-equivalent
-command vocabulary.  Those remain future layers.
+command vocabulary.  Those remain future layers.  A retained CDC pipe pair
+remains reserved until its port epoch changes; the class owner does not support
+true physical teardown and reopen within that epoch.
 
 ## Upstream
 

@@ -45,7 +45,10 @@ $0003 constant cdc-acm-v4-dtr-rts
 100 constant cdc-acm-v4-in-poll-limit
 
 \ Persistent class/session state.  Endpoint addresses and packet sizes are
-\ descriptor-derived.  No variable below ever contains pio-usb-v4-data.
+\ descriptor-derived.  cdc-acm-v4-initialized is the logical-open flag; the
+\ two endpoint-open flags describe the physical core 1 pipes, which remain
+\ open while their enumerated port epoch remains current.  No variable below
+\ ever contains pio-usb-v4-data.
 variable cdc-acm-v4-initialized
 variable cdc-acm-v4-address
 variable cdc-acm-v4-ep0-mps
@@ -128,6 +131,11 @@ variable cdc-acm-v4-scan-in-interval
   ?raise
 ;
 
+: clear-cdc-acm-v4-response-state ( -- )
+  0 cdc-acm-v4-response-length !
+  cdc-acm-v4-response cdc-acm-v4-response-capacity 0 fill
+;
+
 : clear-cdc-acm-v4-local-state ( -- )
   false cdc-acm-v4-initialized !
   0 cdc-acm-v4-address !
@@ -143,8 +151,7 @@ variable cdc-acm-v4-scan-in-interval
   0 cdc-acm-v4-bulk-in-interval !
   false cdc-acm-v4-bulk-out-open !
   false cdc-acm-v4-bulk-in-open !
-  0 cdc-acm-v4-response-length !
-  cdc-acm-v4-response cdc-acm-v4-response-capacity 0 fill
+  clear-cdc-acm-v4-response-state
 ;
 
 \ A host-side wait timeout leaves request/completion ownership unknown.  The
@@ -547,12 +554,16 @@ variable cdc-acm-v4-scan-in-interval
 ;
 
 : close-cdc-acm-v4-in-unlocked ( -- )
+  cdc-acm-v4-endpoint-session-current?
+  averts x-cdc-acm-v4-not-open
   cdc-acm-v4-address @ cdc-acm-v4-bulk-in-endpoint @
   pio-usb-endpoint-close-v4-unlocked
   false cdc-acm-v4-bulk-in-open !
 ;
 
 : close-cdc-acm-v4-out-unlocked ( -- )
+  cdc-acm-v4-endpoint-session-current?
+  averts x-cdc-acm-v4-not-open
   cdc-acm-v4-address @ cdc-acm-v4-bulk-out-endpoint @
   pio-usb-endpoint-close-v4-unlocked
   false cdc-acm-v4-bulk-out-open !
@@ -588,16 +599,48 @@ variable cdc-acm-v4-scan-in-interval
   first-exception
 ;
 
-\ The request order is intentionally the order proven with the target modem:
-\ SET_CONTROL_LINE_STATE(DTR|RTS), then SET_LINE_CODING(115200 8N1), then
-\ persistent bulk OUT and bulk IN opens.  The interrupt endpoint stays closed.
-: do-open-cdc-acm-v4-unlocked ( -- )
-  require-cdc-acm-v4-mailbox-usable
+\ Reuse a complete physical endpoint session only while its address, EP0 MPS,
+\ enumeration epoch, and live port epoch still match.  An epoch change means
+\ core 1 has already discarded the old pipes, so drop only the Forth-local
+\ state; publishing CLOSE with the old endpoint identity would be unsafe.  A
+\ partial current session is not retainable and is cleaned up before a fresh
+\ open.
+: prepare-cdc-acm-v4-open-unlocked ( -- reused? )
+  cdc-acm-v4-bulk-out-open @
+  cdc-acm-v4-bulk-in-open @ or 0= if
+    clear-cdc-acm-v4-local-state
+  else
+    cdc-acm-v4-endpoint-session-current? 0= if
+      clear-cdc-acm-v4-local-state
+    then
+  then
+
   cdc-acm-v4-initialized @ 0=
-  cdc-acm-v4-bulk-out-open @ 0= and
-  cdc-acm-v4-bulk-in-open @ 0= and
   averts x-cdc-acm-v4-already-open
-  clear-cdc-acm-v4-local-state
+
+  cdc-acm-v4-bulk-out-open @
+  cdc-acm-v4-bulk-in-open @ and if
+    clear-cdc-acm-v4-response-state
+    true cdc-acm-v4-initialized !
+    true exit
+  then
+
+  cdc-acm-v4-bulk-out-open @
+  cdc-acm-v4-bulk-in-open @ or if
+    close-cdc-acm-v4-opened-unlocked { exception }
+    exception ?raise
+    clear-cdc-acm-v4-local-state
+  then
+  false
+;
+
+\ A fresh request sequence uses the order proven with the target modem:
+\ SET_CONTROL_LINE_STATE(DTR|RTS), then SET_LINE_CODING(115200 8N1), then
+\ persistent bulk OUT and bulk IN opens.  A later logical reopen keeps those
+\ pipes (and their data toggles) and does not repeat this physical sequence.
+\ The interrupt endpoint stays closed.
+: do-open-cdc-acm-v4-unlocked ( -- )
+  prepare-cdc-acm-v4-open-unlocked if exit then
   require-cdc-acm-v4-enumeration
   discover-cdc-acm-v4
   pio-usb-v4-enumerated-address @ cdc-acm-v4-address !
@@ -633,10 +676,22 @@ variable cdc-acm-v4-scan-in-interval
 ;
 
 : execute-open-cdc-acm-v4-unlocked ( -- )
+  \ Reject a terminal, busy, faulted, or stalled transport before entering the
+  \ cleanup-owning try block.  No CDC state has changed yet, so these failures
+  \ must not tear down a complete retained endpoint session.
+  require-cdc-acm-v4-mailbox-usable
+  require-pio-usb-v4-request-idle
+  pio-usb-core1-v4-alive? averts x-pio-usb-core1-v4-not-running
+  pio-usb-core1-v4-running? averts x-pio-usb-core1-v4-not-running
   ['] do-open-cdc-acm-v4-unlocked try { exception }
   exception 0<> if
     exception cdc-acm-v4-terminal-timeout? if
       invalidate-cdc-acm-v4-after-timeout
+      exception ?raise
+    then
+    \ A duplicate logical open did not alter the complete retained physical
+    \ session.  Report it without turning error cleanup into a physical close.
+    exception ['] x-cdc-acm-v4-already-open = if
       exception ?raise
     then
     close-cdc-acm-v4-opened-unlocked { cleanup-exception }
@@ -767,13 +822,27 @@ variable cdc-acm-v4-scan-in-interval
     clear-cdc-acm-v4-local-state
     exit
   then
+
+  \ A complete current session is quiescent between synchronous transfers.
+  \ Make close logical so the device and host retain their matching bulk data
+  \ toggles.  The next open reactivates these same pipes and the higher-level
+  \ BleuIO layer performs its bootstrap again.
+  cdc-acm-v4-bulk-out-open @
+  cdc-acm-v4-bulk-in-open @ and if
+    false cdc-acm-v4-initialized !
+    clear-cdc-acm-v4-response-state
+    exit
+  then
+
+  \ A partial physical session can only be failed-open cleanup state; unlike a
+  \ complete session it must not be retained.
   close-cdc-acm-v4-opened-unlocked { exception }
   exception cdc-acm-v4-terminal-timeout? if
     invalidate-cdc-acm-v4-after-timeout
     exception ?raise
   then
   false cdc-acm-v4-initialized !
-  0 cdc-acm-v4-response-length !
+  clear-cdc-acm-v4-response-state
   cdc-acm-v4-bulk-out-open @ 0=
   cdc-acm-v4-bulk-in-open @ 0= and if
     clear-cdc-acm-v4-local-state
