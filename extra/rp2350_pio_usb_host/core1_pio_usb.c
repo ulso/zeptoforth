@@ -32,6 +32,7 @@ enum {
     USB_RESET_FRAMES = 50,
     USB_RECOVERY_FRAMES = 10,
     USB_TRANSFER_TIMEOUT_FRAMES = 100,
+    USB_ENDPOINT_TIMEOUT_MAX_FRAMES = 1000,
 };
 
 _Static_assert(PICO_PIO_USB_CLK_SYS_HZ % USB_FRAME_HZ == 0,
@@ -49,6 +50,11 @@ typedef struct {
     uint32_t device_address;
     uint32_t ep0_mps;
     uint32_t length;
+    uint32_t endpoint_address;
+    uint32_t endpoint_attributes;
+    uint32_t endpoint_max_packet;
+    uint32_t endpoint_interval;
+    uint32_t transfer_timeout_frames;
     uint8_t setup[8];
 } command_request_t;
 
@@ -97,12 +103,25 @@ static void clear_volatile_bytes(volatile uint8_t *destination,
     }
 }
 
-static endpoint_t *find_command_endpoint(void) {
+static endpoint_t *find_control_endpoint(uint8_t device_address) {
     for (uint32_t index = 0; index < PIO_USB_EP_POOL_CNT; ++index) {
         endpoint_t *const endpoint = PIO_USB_ENDPOINT(index);
         if (endpoint->size != 0 && endpoint->root_idx == 0 &&
-            endpoint->dev_addr == request.device_address &&
+            endpoint->dev_addr == device_address &&
             (endpoint->ep_num & 0x7fu) == 0) {
+            return endpoint;
+        }
+    }
+    return NULL;
+}
+
+static endpoint_t *find_data_endpoint(uint8_t device_address,
+                                      uint8_t endpoint_address) {
+    for (uint32_t index = 0; index < PIO_USB_EP_POOL_CNT; ++index) {
+        endpoint_t *const endpoint = PIO_USB_ENDPOINT(index);
+        if (endpoint->size != 0 && endpoint->root_idx == 0 &&
+            endpoint->dev_addr == device_address &&
+            endpoint->ep_num == endpoint_address) {
             return endpoint;
         }
     }
@@ -115,27 +134,47 @@ static uint32_t command_endpoint_mask(void) {
                : 1u << (uint32_t)(command_endpoint - pio_usb_ep_pool);
 }
 
-static bool root_has_open_endpoints(void) {
+static bool root_has_open_data_endpoints(void) {
     for (uint32_t index = 0; index < PIO_USB_EP_POOL_CNT; ++index) {
         endpoint_t const *const endpoint = PIO_USB_ENDPOINT(index);
-        if (endpoint->size != 0 && endpoint->root_idx == 0) {
+        if (endpoint->size != 0 && endpoint->root_idx == 0 &&
+            (endpoint->ep_num & 0x7fu) != 0) {
             return true;
         }
     }
     return false;
 }
 
+static void sanitize_endpoint(endpoint_t *endpoint) {
+    endpoint->new_data_flag = false;
+    endpoint->stalled = false;
+    endpoint->has_transfer = false;
+    endpoint->transfer_started = false;
+    endpoint->transfer_aborted = false;
+    endpoint->app_buf = NULL;
+    endpoint->total_len = 0;
+    endpoint->actual_len = 0;
+    endpoint->encoded_data_len = 0;
+    endpoint->failed_count = 0;
+    endpoint->data_id = 0;
+    endpoint->size = 0;
+}
+
 static void close_all_root_endpoints(void) {
     for (uint32_t index = 0; index < PIO_USB_EP_POOL_CNT; ++index) {
         endpoint_t *const endpoint = PIO_USB_ENDPOINT(index);
         if (endpoint->size != 0 && endpoint->root_idx == 0) {
-            endpoint->has_transfer = false;
-            endpoint->transfer_started = false;
-            endpoint->transfer_aborted = false;
-            endpoint->size = 0;
+            sanitize_endpoint(endpoint);
         }
     }
     command_endpoint = NULL;
+}
+
+static void clear_endpoint_latch_mask(uint32_t mask) {
+    endpoint_complete_latch &= ~mask;
+    endpoint_error_latch &= ~mask;
+    endpoint_stalled_latch &= ~mask;
+    __asm volatile("dmb" ::: "memory");
 }
 
 static void clear_endpoint_latches(void) {
@@ -146,11 +185,25 @@ static void clear_endpoint_latches(void) {
 }
 
 static void clear_command_endpoint_latches(void) {
+    clear_endpoint_latch_mask(command_endpoint_mask());
+}
+
+static void close_control_endpoint(void) {
+    endpoint_t *const endpoint = command_endpoint;
+    if (endpoint == NULL) {
+        return;
+    }
+
     uint32_t const mask = command_endpoint_mask();
-    endpoint_complete_latch &= ~mask;
-    endpoint_error_latch &= ~mask;
-    endpoint_stalled_latch &= ~mask;
-    __asm volatile("dmb" ::: "memory");
+    uint8_t const device_address = endpoint->dev_addr;
+    uint8_t const endpoint_address = endpoint->ep_num;
+    if (endpoint->size != 0 && !endpoint->has_transfer) {
+        (void)pio_usb_host_endpoint_close(0, device_address,
+                                          endpoint_address);
+    }
+    sanitize_endpoint(endpoint);
+    clear_endpoint_latch_mask(mask);
+    command_endpoint = NULL;
 }
 
 static void publish_command_result(uint32_t status, uint32_t phase,
@@ -186,9 +239,10 @@ static void fail_command(root_port_t *root, uint32_t status, uint32_t now,
                          bool invalidate_session) {
     if (invalidate_session) {
         set_port_recovery_required(root);
+    } else if (request.command == CORE1_COMMAND_CONTROL_TRANSFER) {
+        close_control_endpoint();
     } else {
-        close_all_root_endpoints();
-        clear_endpoint_latches();
+        command_endpoint = NULL;
     }
     command_phase = CORE1_COMMAND_PHASE_IDLE;
     publish_command_result(status, CORE1_COMMAND_PHASE_ERROR, now);
@@ -219,6 +273,11 @@ static void snapshot_request(void) {
     request.device_address = core1_shared.device_address;
     request.ep0_mps = core1_shared.ep0_mps;
     request.length = core1_shared.transfer_length;
+    request.endpoint_address = core1_shared.endpoint_address;
+    request.endpoint_attributes = core1_shared.endpoint_attributes;
+    request.endpoint_max_packet = core1_shared.endpoint_max_packet;
+    request.endpoint_interval = core1_shared.endpoint_interval;
+    request.transfer_timeout_frames = core1_shared.transfer_timeout_frames;
     copy_bytes(request.setup, core1_shared.setup, sizeof(request.setup));
 }
 
@@ -226,6 +285,58 @@ static bool validate_control_request(void) {
     return request.device_address <= 127 && valid_ep0_mps(request.ep0_mps) &&
            request.length <= CORE1_CONTROL_DATA_CAPACITY &&
            setup_length(request.setup) == request.length;
+}
+
+static bool valid_data_endpoint_address(uint32_t address) {
+    return address <= UINT8_MAX && (address & 0x70u) == 0 &&
+           (address & 0x0fu) != 0;
+}
+
+static bool valid_bulk_packet_size(uint32_t size) {
+    return size == 8 || size == 16 || size == 32 || size == 64;
+}
+
+static bool validate_endpoint_open_request(void) {
+    if (request.device_address == 0 || request.device_address > 127 ||
+        !valid_data_endpoint_address(request.endpoint_address) ||
+        request.endpoint_attributes > UINT8_MAX ||
+        request.endpoint_interval > UINT8_MAX || request.length != 0) {
+        return false;
+    }
+
+    if (request.endpoint_attributes == EP_ATTR_BULK) {
+        return valid_bulk_packet_size(request.endpoint_max_packet);
+    }
+    if (request.endpoint_attributes == EP_ATTR_INTERRUPT) {
+        return request.endpoint_max_packet > 0 &&
+               request.endpoint_max_packet <= PIO_USB_EP_SIZE &&
+               request.endpoint_interval != 0;
+    }
+    return false;
+}
+
+static bool validate_endpoint_reference(void) {
+    return request.device_address > 0 && request.device_address <= 127 &&
+           valid_data_endpoint_address(request.endpoint_address);
+}
+
+static bool control_request_changes_topology(void) {
+    uint8_t const request_type = request.setup[0];
+    uint8_t const usb_request = request.setup[1];
+    bool const standard_out = (request_type & 0xe0u) == 0;
+    return standard_out &&
+           (usb_request == 5u || usb_request == 9u || usb_request == 11u);
+}
+
+static bool control_request_clears_open_endpoint_halt(void) {
+    if (request.setup[0] != 0x02u || request.setup[1] != 1u ||
+        request.setup[2] != 0 || request.setup[3] != 0 ||
+        request.setup[5] != 0 ||
+        setup_length(request.setup) != 0) {
+        return false;
+    }
+    return find_data_endpoint((uint8_t)request.device_address,
+                              request.setup[4]) != NULL;
 }
 
 static void begin_port_reset(uint32_t now) {
@@ -253,15 +364,27 @@ static void begin_control_transfer(root_port_t *root, uint32_t now) {
         .interval = 0,
     };
 
-    if (root_has_open_endpoints() ||
-        !pio_usb_host_endpoint_open(0, device_address,
+    if (find_control_endpoint(device_address) != NULL) {
+        /* A previous command must never leave EP0 open.  Treat this as an
+         * internal transport invariant failure rather than leaking it into
+         * subsequent commands. */
+        fail_command(root, CORE1_COMMAND_ERROR_ENDPOINT_BUSY, now, true);
+        return;
+    }
+    if ((root_has_open_data_endpoints() &&
+         control_request_changes_topology()) ||
+        control_request_clears_open_endpoint_halt()) {
+        fail_command(root, CORE1_COMMAND_ERROR_PORT_STATE, now, false);
+        return;
+    }
+    if (!pio_usb_host_endpoint_open(0, device_address,
                                     (const uint8_t *)&endpoint, false)) {
         fail_command(root, CORE1_COMMAND_ERROR_ENDPOINT_OPEN, now, false);
         return;
     }
-    command_endpoint = find_command_endpoint();
+    command_endpoint = find_control_endpoint(device_address);
     if (command_endpoint == NULL) {
-        fail_command(root, CORE1_COMMAND_ERROR_ENDPOINT_OPEN, now, false);
+        fail_command(root, CORE1_COMMAND_ERROR_ENDPOINT_OPEN, now, true);
         return;
     }
 
@@ -272,6 +395,142 @@ static void begin_control_transfer(root_port_t *root, uint32_t now) {
     }
     command_phase = CORE1_COMMAND_PHASE_SETUP;
     command_deadline = now + USB_TRANSFER_TIMEOUT_FRAMES;
+    core1_shared.command_phase = command_phase;
+    core1_shared.command_deadline_frame = command_deadline;
+}
+
+static void complete_immediate_command(uint32_t status, uint32_t now) {
+    command_phase = CORE1_COMMAND_PHASE_IDLE;
+    command_endpoint = NULL;
+    publish_command_result(status, CORE1_COMMAND_PHASE_COMPLETE, now);
+}
+
+static void open_data_endpoint(root_port_t *root, uint32_t now) {
+    uint8_t const device_address = (uint8_t)request.device_address;
+    uint8_t const endpoint_address = (uint8_t)request.endpoint_address;
+    if (find_data_endpoint(device_address, endpoint_address) != NULL) {
+        publish_command_result(CORE1_COMMAND_ERROR_ENDPOINT_ALREADY_OPEN,
+                               CORE1_COMMAND_PHASE_ERROR, now);
+        return;
+    }
+
+    endpoint_descriptor_t endpoint = {
+        .length = 7,
+        .type = DESC_TYPE_ENDPOINT,
+        .epaddr = endpoint_address,
+        .attr = (uint8_t)request.endpoint_attributes,
+        .max_size = {(uint8_t)request.endpoint_max_packet,
+                     (uint8_t)(request.endpoint_max_packet >> 8)},
+        .interval = (uint8_t)request.endpoint_interval,
+    };
+    if (!pio_usb_host_endpoint_open(0, device_address,
+                                    (const uint8_t *)&endpoint, false)) {
+        publish_command_result(CORE1_COMMAND_ERROR_ENDPOINT_OPEN,
+                               CORE1_COMMAND_PHASE_ERROR, now);
+        return;
+    }
+
+    endpoint_t *const opened =
+        find_data_endpoint(device_address, endpoint_address);
+    bool const expected_tx = (endpoint_address & 0x80u) == 0;
+    if (opened == NULL || opened->attr != request.endpoint_attributes ||
+        opened->size != request.endpoint_max_packet ||
+        opened->interval != request.endpoint_interval ||
+        opened->is_tx != expected_tx || opened->need_pre) {
+        core1_shared.failure_detail = endpoint_address;
+        fail_command(root, CORE1_COMMAND_ERROR_ENDPOINT_OPEN, now, true);
+        return;
+    }
+    complete_immediate_command(CORE1_COMMAND_OK, now);
+}
+
+static void close_data_endpoint(root_port_t *root, uint32_t now) {
+    uint8_t const device_address = (uint8_t)request.device_address;
+    uint8_t const endpoint_address = (uint8_t)request.endpoint_address;
+    endpoint_t *const endpoint =
+        find_data_endpoint(device_address, endpoint_address);
+    if (endpoint == NULL) {
+        publish_command_result(CORE1_COMMAND_ERROR_ENDPOINT_NOT_OPEN,
+                               CORE1_COMMAND_PHASE_ERROR, now);
+        return;
+    }
+    if (endpoint->has_transfer || endpoint->transfer_started) {
+        publish_command_result(CORE1_COMMAND_ERROR_ENDPOINT_BUSY,
+                               CORE1_COMMAND_PHASE_ERROR, now);
+        return;
+    }
+
+    uint32_t const mask = 1u << (uint32_t)(endpoint - pio_usb_ep_pool);
+    if (!pio_usb_host_endpoint_close(0, device_address, endpoint_address)) {
+        core1_shared.failure_detail = endpoint_address;
+        fail_command(root, CORE1_COMMAND_ERROR_TRANSFER, now, true);
+        return;
+    }
+    sanitize_endpoint(endpoint);
+    clear_endpoint_latch_mask(mask);
+    complete_immediate_command(CORE1_COMMAND_OK, now);
+}
+
+static bool validate_endpoint_transfer(endpoint_t const *endpoint) {
+    if (request.length == 0 || request.length > CORE1_CONTROL_DATA_CAPACITY ||
+        request.transfer_timeout_frames == 0 ||
+        request.transfer_timeout_frames > USB_ENDPOINT_TIMEOUT_MAX_FRAMES) {
+        return false;
+    }
+    uint8_t const transfer_type = endpoint->attr;
+    if ((transfer_type != EP_ATTR_BULK &&
+         transfer_type != EP_ATTR_INTERRUPT) ||
+        endpoint->need_pre ||
+        endpoint->is_tx != ((request.endpoint_address & 0x80u) == 0)) {
+        return false;
+    }
+    if (transfer_type == EP_ATTR_INTERRUPT &&
+        request.transfer_timeout_frames < endpoint->interval) {
+        return false;
+    }
+    if (transfer_type == EP_ATTR_BULK) {
+        return valid_bulk_packet_size(endpoint->size);
+    }
+    return endpoint->size > 0 && endpoint->size <= PIO_USB_EP_SIZE &&
+           endpoint->interval != 0;
+}
+
+static void begin_endpoint_transfer(root_port_t *root, uint32_t now) {
+    uint8_t const device_address = (uint8_t)request.device_address;
+    uint8_t const endpoint_address = (uint8_t)request.endpoint_address;
+    command_endpoint = find_data_endpoint(device_address, endpoint_address);
+    if (command_endpoint == NULL) {
+        publish_command_result(CORE1_COMMAND_ERROR_ENDPOINT_NOT_OPEN,
+                               CORE1_COMMAND_PHASE_ERROR, now);
+        return;
+    }
+    if (command_endpoint->has_transfer || command_endpoint->transfer_started) {
+        command_endpoint = NULL;
+        publish_command_result(CORE1_COMMAND_ERROR_ENDPOINT_BUSY,
+                               CORE1_COMMAND_PHASE_ERROR, now);
+        return;
+    }
+    if (!validate_endpoint_transfer(command_endpoint)) {
+        command_endpoint = NULL;
+        publish_command_result(CORE1_COMMAND_ERROR_INVALID,
+                               CORE1_COMMAND_PHASE_ERROR, now);
+        return;
+    }
+
+    clear_command_endpoint_latches();
+    if ((endpoint_address & 0x80u) != 0) {
+        clear_volatile_bytes(core1_shared.data, request.length);
+    }
+    if (!pio_usb_host_endpoint_transfer(
+            0, device_address, endpoint_address,
+            (uint8_t *)(uintptr_t)core1_shared.data,
+            (uint16_t)request.length)) {
+        core1_shared.failure_detail = endpoint_address;
+        fail_command(root, CORE1_COMMAND_ERROR_TRANSFER, now, true);
+        return;
+    }
+    command_phase = CORE1_COMMAND_PHASE_ENDPOINT_DATA;
+    command_deadline = now + request.transfer_timeout_frames;
     core1_shared.command_phase = command_phase;
     core1_shared.command_deadline_frame = command_deadline;
 }
@@ -292,7 +551,10 @@ static void start_command(root_port_t *root, uint32_t now) {
     __asm volatile("dmb" ::: "memory");
 
     if (request.command != CORE1_COMMAND_PORT_RESET &&
-        request.command != CORE1_COMMAND_CONTROL_TRANSFER) {
+        request.command != CORE1_COMMAND_CONTROL_TRANSFER &&
+        request.command != CORE1_COMMAND_ENDPOINT_OPEN &&
+        request.command != CORE1_COMMAND_ENDPOINT_CLOSE &&
+        request.command != CORE1_COMMAND_ENDPOINT_TRANSFER) {
         publish_command_result(CORE1_COMMAND_ERROR_INVALID,
                                CORE1_COMMAND_PHASE_ERROR, now);
         return;
@@ -329,12 +591,34 @@ static void start_command(root_port_t *root, uint32_t now) {
                                CORE1_COMMAND_PHASE_ERROR, now);
         return;
     }
-    if (!validate_control_request()) {
+    if (request.command == CORE1_COMMAND_CONTROL_TRANSFER) {
+        if (!validate_control_request()) {
+            publish_command_result(CORE1_COMMAND_ERROR_INVALID,
+                                   CORE1_COMMAND_PHASE_ERROR, now);
+            return;
+        }
+        begin_control_transfer(root, now);
+        return;
+    }
+    if (!validate_endpoint_reference()) {
         publish_command_result(CORE1_COMMAND_ERROR_INVALID,
                                CORE1_COMMAND_PHASE_ERROR, now);
         return;
     }
-    begin_control_transfer(root, now);
+    if (request.command == CORE1_COMMAND_ENDPOINT_OPEN) {
+        if (!validate_endpoint_open_request()) {
+            publish_command_result(CORE1_COMMAND_ERROR_INVALID,
+                                   CORE1_COMMAND_PHASE_ERROR, now);
+            return;
+        }
+        open_data_endpoint(root, now);
+        return;
+    }
+    if (request.command == CORE1_COMMAND_ENDPOINT_CLOSE) {
+        close_data_endpoint(root, now);
+        return;
+    }
+    begin_endpoint_transfer(root, now);
 }
 
 static uint32_t consume_endpoint_result(uint32_t *complete,
@@ -440,6 +724,7 @@ static void service_command(root_port_t *root, uint32_t now) {
     }
     if ((stalled & mask) != 0) {
         core1_shared.failure_detail = stalled & mask;
+        core1_shared.actual_length = command_endpoint->actual_len;
         fail_command(root, CORE1_COMMAND_ERROR_STALL, now, false);
         return;
     }
@@ -479,8 +764,22 @@ static void service_command(root_port_t *root, uint32_t now) {
         }
 
         if (command_phase == CORE1_COMMAND_PHASE_STATUS) {
-            close_all_root_endpoints();
-            clear_endpoint_latches();
+            close_control_endpoint();
+            command_phase = CORE1_COMMAND_PHASE_IDLE;
+            publish_command_result(CORE1_COMMAND_OK,
+                                   CORE1_COMMAND_PHASE_COMPLETE, now);
+            return;
+        }
+
+        if (command_phase == CORE1_COMMAND_PHASE_ENDPOINT_DATA) {
+            uint32_t const actual = command_endpoint->actual_len;
+            bool const is_in = (request.endpoint_address & 0x80u) != 0;
+            core1_shared.actual_length = actual;
+            if (actual > request.length || (!is_in && actual != request.length)) {
+                fail_command(root, CORE1_COMMAND_ERROR_TRANSFER, now, true);
+                return;
+            }
+            command_endpoint = NULL;
             command_phase = CORE1_COMMAND_PHASE_IDLE;
             publish_command_result(CORE1_COMMAND_OK,
                                    CORE1_COMMAND_PHASE_COMPLETE, now);
@@ -493,6 +792,27 @@ static void service_command(root_port_t *root, uint32_t now) {
 
     if (endpoint_result == 0 &&
         frame_deadline_reached(now, command_deadline)) {
+        if (command_phase == CORE1_COMMAND_PHASE_ENDPOINT_DATA) {
+            endpoint_t *const endpoint = command_endpoint;
+            uint32_t const actual = endpoint->actual_len;
+            if (!pio_usb_host_endpoint_abort_transfer(
+                    0, (uint8_t)request.device_address,
+                    (uint8_t)request.endpoint_address)) {
+                fail_command(root, CORE1_COMMAND_ERROR_TRANSFER, now, true);
+                return;
+            }
+            core1_shared.actual_length = actual;
+            clear_command_endpoint_latches();
+            command_endpoint = NULL;
+            command_phase = CORE1_COMMAND_PHASE_IDLE;
+            publish_command_result(
+                actual == 0 ? CORE1_COMMAND_ERROR_TIMEOUT
+                            : CORE1_COMMAND_PARTIAL,
+                actual == 0 ? CORE1_COMMAND_PHASE_ERROR
+                            : CORE1_COMMAND_PHASE_COMPLETE,
+                now);
+            return;
+        }
         fail_command(root, CORE1_COMMAND_ERROR_TIMEOUT, now, true);
     }
 }
@@ -575,6 +895,10 @@ static void track_connection_epoch(root_port_t *root) {
         return;
     }
     last_root_connected = connected;
+    if (!connected) {
+        close_all_root_endpoints();
+        clear_endpoint_latches();
+    }
     session_ready = false;
     core1_shared.port_epoch = next_epoch(core1_shared.port_epoch);
     core1_shared.port_state = connected ? CORE1_PORT_ATTACHED_SUSPENDED
@@ -617,7 +941,8 @@ __attribute__((noreturn)) void core1_main(void) {
     core1_shared.clock_hz = PICO_PIO_USB_CLK_SYS_HZ;
     core1_shared.abi_bytes = CORE1_ABI_BYTES;
     core1_shared.capabilities =
-        CORE1_CAP_PORT_RESET | CORE1_CAP_CONTROL_TRANSFER;
+        CORE1_CAP_PORT_RESET | CORE1_CAP_CONTROL_TRANSFER |
+        CORE1_CAP_ENDPOINT_LIFECYCLE | CORE1_CAP_ENDPOINT_TRANSFER;
     core1_shared.data_capacity = CORE1_CONTROL_DATA_CAPACITY;
     core1_shared.port_epoch = 1;
     core1_shared.port_state = CORE1_PORT_DETACHED;

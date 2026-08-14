@@ -16,11 +16,13 @@ The design deliberately separates responsibilities:
 
 This is research code, not yet a general USB host implementation.
 
-The current sources implement ABI v3.  The earlier ABI-v2 descriptor smoke is
-retained below as a reproducible historical checkpoint; it should not be mixed
-with the current image or helper.
+The current sources implement ABI v4, including persistent endpoint sessions
+and bounded non-control transfers.  The earlier ABI-v2 descriptor smoke and
+ABI-v3 control/enumeration milestones are retained below as reproducible
+historical checkpoints; their images and helpers must not be mixed with ABI
+v4.
 
-## Verified ABI-v2 descriptor-smoke checkpoint
+## Verified historical ABI-v2 descriptor-smoke checkpoint
 
 The ABI v2 image implements one bounded command: a 50 ms bus reset followed by
 a request for the first eight bytes of the device descriptor.  On 2026-08-13,
@@ -46,9 +48,9 @@ SHA256:  42875e20f468b57b13ce0578756ea5603b5fb581622bd0c6f3543c97b7de2a94
 The ELF SHA may vary with debug paths and metadata.  The loadable BIN hash
 identifies the exact artifact used for this checkpoint.
 The matching ABI-v2 sources are preserved in commit `87436954`; that artifact
-and `descriptor_smoke.fs` must not be mixed with the current ABI-v3 sources.
+and `descriptor_smoke.fs` must not be mixed with the current ABI-v4 sources.
 
-## Verified generic-control milestone
+## Verified historical ABI-v3 generic-control milestone
 
 ABI v3 replaces the scripted descriptor command with two bounded transport
 operations: `PORT_RESET` and a generic USB control transfer.  Core 1 owns the
@@ -71,7 +73,7 @@ mask was 1, and the error, stall, failure-detail, and core-fault fields were all
 zero.  The native USB Forth console remained responsive and the core 1
 heartbeat continued to advance.
 
-Current reference runtime artifact:
+Historical ABI-v3 reference runtime artifact:
 
 ```text
 core1_pio_usb.bin
@@ -79,10 +81,9 @@ size:    17664 bytes (0x4500)
 SHA256:  07f806f909f31a7c17d748bea87ac453b222c7b0a8a93a98b67f121cce8e3308
 ```
 
-This proves the generic endpoint-zero transport on the current Cytron/BleuIO
-setup.
+This proved the generic endpoint-zero transport on the Cytron/BleuIO setup.
 
-## Verified Forth-owned root enumeration milestone
+## Verified historical ABI-v3 Forth-owned root enumeration milestone
 
 On 2026-08-14, the definitions-only `full_enumeration_v3.fs` module used the
 same generic ABI-v3 transport to perform the complete standard control path:
@@ -109,8 +110,48 @@ interface 1: CDC data,    bulk IN       0x81, MPS 64
 The helper finished at stage 9 with its complete flag set and no exception.
 The core-1 command status was `OK`; endpoint error, endpoint stall, and core
 fault were all zero, and the native USB Forth console remained responsive.
-This milestone does not open the discovered endpoints or implement CDC/ACM
-data transfers yet.
+This historical milestone did not open the discovered endpoints or implement
+CDC/ACM data transfers.  The matching ABI-v3 checkpoint is preserved in commit
+`a9a57a69`.
+
+## Verified current ABI-v4 CDC-ACM milestone
+
+ABI v4 retains the Forth-owned control and enumeration policy from ABI v3 and
+adds generic persistent endpoint open/close operations plus bounded IN and OUT
+transfers.  Core 1 owns each open endpoint's transport state and data toggle;
+Forth on core 0 discovers the class topology, issues the CDC class requests,
+and decides which endpoints to open.
+
+The three definitions-only helpers compiled successfully on the target:
+
+- `enumeration_v4.fs` exposes the ABI-v4 launch, control, endpoint-lifecycle,
+  and transfer primitives;
+- `full_enumeration_v4.fs` performs and validates complete root enumeration,
+  retaining stable descriptor copies; and
+- `cdc_acm_v4.fs` finds a valid CDC Union/data-interface pair, applies
+  `SET_CONTROL_LINE_STATE` and 115200 8N1 `SET_LINE_CODING`, opens only the
+  bulk data endpoints, and provides a bounded `AT\r\n` smoke test.
+
+On 2026-08-14, the ABI-v4 image and all three helpers were exercised on a
+Cytron MOTION 2350 Pro with a directly attached BleuIO.  It enumerated as
+VID:PID `2DCF:6002`, configuration 1, with CDC control interface 0 and CDC data
+interface 1.  The selected endpoints were bulk OUT `0x02` and bulk IN `0x81`,
+both with MPS 64.
+
+Repeated `AT\r\n` transfers returned the optional command echo followed by a
+complete `OK\r\n` line.  An empty bulk-IN poll completed with the nonfatal USB
+transfer status `TIMEOUT` (`0x8B`) and actual length 0; a subsequent `AT`
+exchange succeeded without reopening the endpoints.  Explicit close followed
+by reopen also succeeded.  Throughout the run, the native Zeptoforth USB CDC
+console remained responsive and core 1 reported `fault = 0`.
+
+Current reference runtime artifact:
+
+```text
+core1_pio_usb.bin
+size:    19120 bytes (0x4ab0)
+SHA256:  637f9b88b15b344a2147203eaa373d571224c6ff1eaa4e56d215fa9d780f50cf
+```
 
 ## Hardware and resource contract
 
@@ -130,7 +171,7 @@ The hardware preflight detects enabled SM0-SM2 and an actively busy DMA0.  It
 cannot detect an idle software claim, SM3 use, or existing PIO instructions.
 Start only from a clean reset where no other PIO or DMA code has run.
 
-## Current ABI-v3 SRAM layout
+## Current ABI-v4 SRAM layout
 
 `src/rp2350_1core/config.s` lowers Zeptoforth's `ram_end` to `0x20060000`.
 The upper 136 KiB is reserved for the freestanding image:
@@ -140,8 +181,8 @@ Zeptoforth RAM end:  0x20060000
 core 1 reservation: 0x20060000..0x20082000
 vector table:        0x20060000
 entry instruction:   0x200604c0
-initialized copy:    0x20060000..0x20064500
-BSS:                 0x20064500..0x20065f74
+initialized copy:    0x20060000..0x20064ab0
+BSS:                 0x20064ab0..0x2006653c
 shared ABI:          0x20080e00..0x20081000
 core 1 stack:        0x20081000..0x20082000
 ```
@@ -197,10 +238,11 @@ The small original heartbeat-only image remains available with:
 make -C extra/rp2350_pio_usb_host inspect
 ```
 
-The address block above and `enumeration_v3.fs` are pinned to the current
-ABI-v3 BIN hash.  `descriptor_smoke.fs` is instead pinned to the historical
-ABI-v2 artifact and must not be used with ABI v3.  Any rebuild that changes the
-current hash must re-derive and verify `core1_entry`, `__core1_copy_end`,
+The address block above and `enumeration_v4.fs` are pinned to the current
+ABI-v4 BIN hash.  `enumeration_v3.fs` and `full_enumeration_v3.fs` belong to the
+historical ABI-v3 artifact; `descriptor_smoke.fs` belongs to ABI v2.  None may
+be mixed across ABI versions.  Any rebuild that changes the current hash must
+re-derive and verify `core1_entry`, `__core1_copy_end`, `__bss_end__`,
 `core1_shared`, and `__core1_shared_end`; the linker must fail rather than move
 or resize the fixed `0x20080e00..0x20081000` mailbox.  Before running a new
 artifact, confirm that it has no undefined symbols or relocations and that
@@ -213,55 +255,79 @@ arm-none-eabi-readelf -l -r \
   extra/rp2350_pio_usb_host/build/core1_pio_usb.elf
 ```
 
-## Running the current ABI-v3 checkpoint
+## Running the current ABI-v4 checkpoint
 
 The image is a raw SRAM payload, not firmware that can be flashed by itself.
-`enumeration_v3.fs` and `full_enumeration_v3.fs` only define words; loading
-either file does not launch core 1, reset the port, or contact a USB device.
+`enumeration_v4.fs`, `full_enumeration_v4.fs`, and `cdc_acm_v4.fs` only define
+words and initialize RAM-local helper state.  Loading them does not launch core
+1, reset the port, enumerate a device, issue a class request, or open an
+endpoint.
 
 The safe sequence is:
 
 1. Reset into the carved `rp2350_1core` Zeptoforth baseline.
 2. Confirm `ram-end` is `0x20060000`.
-3. Load the matching 17664-byte BIN at `0x20060000` while both cores are
-   stopped, read back through `0x20064500`, and require the SHA above.
-4. Load `enumeration_v3.fs` and `full_enumeration_v3.fs` over the native USB
-   console.
-5. Invoke `launch-pio-usb-core1-v3` exactly once.
-6. Require ABI 3, phase 4, a changing heartbeat, `fault=0`,
+3. Load the matching 19120-byte BIN at `0x20060000` while both cores are
+   stopped, read back through `0x20064ab0`, and require the SHA above.
+4. Load `enumeration_v4.fs`, `full_enumeration_v4.fs`, and `cdc_acm_v4.fs`, in
+   that order, over the native USB console.
+5. Invoke `launch-pio-usb-core1-v4` exactly once.
+6. Require ABI 4, phase 4, a changing heartbeat, `fault=0`,
    `connected=1`, `full-speed=1`, and no resource conflict.
-7. Only then issue the bounded reset and generic control-transfer smoke.
-8. After the smoke succeeds, run the full control-only root enumeration.
+7. Run the complete root enumeration.
+8. Open the discovered CDC ACM function, then run one or more bounded `AT`
+   smokes.
+9. Close the CDC data endpoints when finished.  A later explicit reopen is
+   supported while the port epoch and enumeration remain current.
 
-The exact first milestone can be displayed with:
+The endpoint-zero descriptor smoke remains available with:
 
 ```forth
-: show-v3-smoke
-  pio-usb-get-device-descriptor-8-v3
+: show-v4-smoke
+  pio-usb-get-device-descriptor-8-v4
   0 do dup i + c@ h.2 space loop drop
 ;
-show-v3-smoke
+show-v4-smoke
 ```
 
-The expected bytes are `12 01 00 02 02 02 00 08`.  Do not publish a second
-command after a timeout or stopped heartbeat; reset the complete target first.
+The expected bytes are `12 01 00 02 02 02 00 08`.
 
-The verified complete enumeration is invoked explicitly; it is never run while
-either helper file is loaded:
+The verified enumeration and CDC sequence is invoked explicitly:
 
 ```forth
 hex
-pio-usb-enumerate-root-control-v3 .s
+pio-usb-enumerate-root-control-v4 .s
 decimal
+open-cdc-acm-v4
+cdc-acm-v4-at-smoke
+close-cdc-acm-v4
 ```
 
 The four returned values are `( address configuration vid pid )`; for the
 tested BleuIO, the stack contains `1 1 2DCF 6002`.  On success,
-`pio-usb-v3-enumeration-stage` is 9,
-`pio-usb-v3-enumeration-complete?` is true, and the stable descriptor copies
+`pio-usb-v4-enumeration-stage` is 9,
+`pio-usb-v4-enumeration-complete?` is true, and the stable descriptor copies
 and normalized interface/endpoint records can be inspected without reusing the
-shared control buffer.  The next development step is opening the parsed CDC
-endpoints and transferring CDC/ACM data while core 0 retains class policy.
+shared control buffer.  The CDC helper leaves the interrupt notification
+endpoint closed; its smoke sends exactly `41 54 0D 0A` and requires a complete
+`OK\r\n` response line within bounded polls and a 256-byte local buffer.
+
+Two different timeout cases must not be confused.  A completed endpoint IN
+request with USB transfer status `TIMEOUT` (`0x8B`) and actual length 0 is a
+normal, nonfatal empty poll; the endpoint session and data toggle remain valid.
+A core-0 host-side mailbox wait that expires instead raises
+`x-pio-usb-v4-timeout`, leaving request/completion ownership unknown.  That is
+terminal: do not issue cleanup or another command, and reset or power-cycle the
+complete target first.  Also reset if the heartbeat stops or the native console
+misbehaves.
+
+## Running the historical ABI-v3 checkpoints
+
+The exact ABI-v3 image, helpers, and procedure are preserved in commit
+`a9a57a69`.  They establish the generic endpoint-zero transport and complete
+Forth-owned root enumeration described above, but do not support persistent
+CDC data endpoints.  Do not load an ABI-v3 helper against the current ABI-v4
+image.
 
 ## Running the historical ABI-v2 checkpoint
 
@@ -304,6 +370,16 @@ The mailbox timeouts cannot recover if an upstream synchronous PIO/DMA wait
 loop itself hangs.  If the heartbeat stops, the native console misbehaves, or
 completion is absent after one second, perform a full reset or power cycle and
 do not publish another command.
+
+## Current limitations
+
+The verified ABI-v4 path is still a single directly attached, full-speed root
+device experiment.  It does not implement hubs, low-speed devices, VBUS power
+control, hot-plug policy above the core-1 transport, or CDC notification
+handling.  The class helper intentionally accepts only a validated CDC ACM
+control interface with one Union-linked alternate-zero data interface and
+exactly one bulk IN plus one bulk OUT endpoint.  General multi-device and
+multi-class policy remains future work.
 
 ## Upstream
 

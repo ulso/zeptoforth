@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define CORE1_ABI_MAGIC 0x43505531u /* "CPU1" */
-#define CORE1_ABI_VERSION 3u
+#define CORE1_ABI_VERSION 4u
 #define CORE1_ABI_BYTES 512u
 #define CORE1_CONTROL_DATA_CAPACITY 256u
 
@@ -16,6 +16,8 @@ enum {
 enum {
     CORE1_CAP_PORT_RESET = 1u << 0,
     CORE1_CAP_CONTROL_TRANSFER = 1u << 1,
+    CORE1_CAP_ENDPOINT_LIFECYCLE = 1u << 2,
+    CORE1_CAP_ENDPOINT_TRANSFER = 1u << 3,
 };
 
 enum {
@@ -30,12 +32,16 @@ enum {
     CORE1_COMMAND_NONE = 0,
     CORE1_COMMAND_PORT_RESET = 1,
     CORE1_COMMAND_CONTROL_TRANSFER = 2,
+    CORE1_COMMAND_ENDPOINT_OPEN = 3,
+    CORE1_COMMAND_ENDPOINT_CLOSE = 4,
+    CORE1_COMMAND_ENDPOINT_TRANSFER = 5,
 };
 
 enum {
     CORE1_COMMAND_IDLE = 0,
     CORE1_COMMAND_BUSY = 1,
     CORE1_COMMAND_OK = 2,
+    CORE1_COMMAND_PARTIAL = 3,
     CORE1_COMMAND_ERROR_INVALID = 0x80,
     CORE1_COMMAND_ERROR_STALE_EPOCH,
     CORE1_COMMAND_ERROR_NOT_CONNECTED,
@@ -49,6 +55,9 @@ enum {
     CORE1_COMMAND_ERROR_STALL,
     CORE1_COMMAND_ERROR_TIMEOUT,
     CORE1_COMMAND_ERROR_DISCONNECT,
+    CORE1_COMMAND_ERROR_ENDPOINT_NOT_OPEN,
+    CORE1_COMMAND_ERROR_ENDPOINT_ALREADY_OPEN,
+    CORE1_COMMAND_ERROR_ENDPOINT_BUSY,
 };
 
 enum {
@@ -59,6 +68,7 @@ enum {
     CORE1_COMMAND_PHASE_DATA = 4,
     CORE1_COMMAND_PHASE_STATUS = 5,
     CORE1_COMMAND_PHASE_COMPLETE = 6,
+    CORE1_COMMAND_PHASE_ENDPOINT_DATA = 7,
     CORE1_COMMAND_PHASE_ERROR = 0x80,
 };
 
@@ -113,7 +123,17 @@ typedef struct {
     volatile uint32_t endpoint_stalled;
     volatile uint32_t failure_detail;
 
-    volatile uint32_t reserved[(0x100u - 0xa8u) / sizeof(uint32_t)];
+    /* ABI-v4 endpoint request extension.  Core 0 publishes these fields with
+     * the rest of the request before request_seq.  The normalized values let
+     * core 1 build a short-lived upstream endpoint descriptor without ever
+     * retaining a pointer into core 0-owned memory. */
+    volatile uint32_t endpoint_address;
+    volatile uint32_t endpoint_attributes;
+    volatile uint32_t endpoint_max_packet;
+    volatile uint32_t endpoint_interval;
+    volatile uint32_t transfer_timeout_frames;
+
+    volatile uint32_t reserved[(0x100u - 0xbcu) / sizeof(uint32_t)];
     volatile uint8_t data[CORE1_CONTROL_DATA_CAPACITY];
 } core1_shared_t;
 
@@ -133,7 +153,11 @@ _Static_assert(offsetof(core1_shared_t, completion_seq) == 0x7c,
                "the core 1 response sequence offset changed");
 _Static_assert(offsetof(core1_shared_t, actual_length) == 0x8c,
                "the actual length offset changed");
+_Static_assert(offsetof(core1_shared_t, endpoint_address) == 0xa8,
+               "the endpoint address offset changed");
+_Static_assert(offsetof(core1_shared_t, transfer_timeout_frames) == 0xb8,
+               "the endpoint timeout offset changed");
 _Static_assert(offsetof(core1_shared_t, data) == 0x100,
-               "the control data offset changed");
+               "the shared data offset changed");
 
 extern core1_shared_t core1_shared;
