@@ -141,9 +141,15 @@ both with MPS 64.
 Repeated `AT\r\n` transfers returned the optional command echo followed by a
 complete `OK\r\n` line.  An empty bulk-IN poll completed with the nonfatal USB
 transfer status `TIMEOUT` (`0x8B`) and actual length 0; a subsequent `AT`
-exchange succeeded without reopening the endpoints.  Explicit close followed
-by reopen also succeeded.  Throughout the run, the native Zeptoforth USB CDC
-console remained responsive and core 1 reported `fault = 0`.
+exchange succeeded without reopening the endpoints.  Later repeated testing
+showed that a physical close followed by reopen in the same configured USB
+session is not reliable: closing currently discards the host endpoint's data
+toggle while the device retains its toggle.  A reopened IN endpoint can then
+discard the first response packet.  Keep the data endpoints open for the whole
+enumerated port epoch, and close them only at final teardown.  Before another
+open, reset the host port and enumerate again.  Throughout the verified runs,
+the native Zeptoforth USB CDC console remained responsive and core 1 reported
+`fault = 0`.
 
 The current `cdc_acm_v4.fs` also exposes bounded, serialized byte-stream
 operations for higher protocol layers:
@@ -176,11 +182,20 @@ synchronization.  A subsequent `AT` succeeded.  `bleuio::close` then closed
 both bulk endpoints; the ABI mailbox was idle, core 1 remained alive, and
 `fault`, CDC terminal-timeout, and BleuIO resync-required were all zero.
 
-This first BleuIO layer is deliberately synchronous.  It does not yet retain
-asynchronous scan events or run a receive task.  If a transport/framing timeout
-makes command boundaries uncertain, `resync-required?` latches true across
-ordinary close/open.  Do not publish another command; reset the target, reload
-the matching helpers, and enumerate again.
+`bleuio_scan.fs` extends that same synchronous stream owner with bounded
+`AT+GAPSCAN=<seconds>` collection.  In the hardware acceptance run, a
+two-second scan retained 28 complete `S` records, including three named
+`HibouAIR`, with zero dropped, oversized, unknown, or truncated records.  It
+consumed the matching nested scan-end record
+`{"SE":21,"evt":{"action":"scan completed"}}`; an ordinary `AT` succeeded
+immediately afterward.  The resync latch and core-1 fault remained zero.
+
+Both BleuIO layers are deliberately synchronous and do not yet run a
+background receive task or retain arbitrary unsolicited events.  If a
+transport/framing timeout makes command boundaries uncertain,
+`resync-required?` latches true across ordinary logical cleanup.  Do not
+publish another command; reset the target, load the matching runtime state,
+and enumerate again.
 
 Current reference runtime artifact:
 
@@ -308,15 +323,17 @@ The safe sequence is:
    stopped, read back through `0x20064ab0`, and require the SHA above.
 4. Load `enumeration_v4.fs`, `full_enumeration_v4.fs`, and `cdc_acm_v4.fs`, in
    that order, over the native USB console.  Load `bleuio.fs` afterward if the
-   high-level BleuIO command API is wanted.
+   high-level BleuIO command API is wanted, followed by `bleuio_scan.fs` for
+   bounded GAP scanning.
 5. Invoke `launch-pio-usb-core1-v4` exactly once.
 6. Require ABI 4, phase 4, a changing heartbeat, `fault=0`,
    `connected=1`, `full-speed=1`, and no resource conflict.
 7. Run the complete root enumeration.
-8. Open the discovered CDC ACM function, then run one or more bounded `AT`
-   smokes.
-9. Close the CDC data endpoints when finished.  A later explicit reopen is
-   supported while the port epoch and enumeration remain current.
+8. Open the discovered CDC ACM function once, then run all bounded commands and
+   scans in the same endpoint session.
+9. Close the CDC data endpoints only when completely finished.  With the
+   current transport, reset the host port and enumerate again before a later
+   open; physical close/reopen in one configured port epoch is not supported.
 
 The endpoint-zero descriptor smoke remains available with:
 
@@ -359,7 +376,6 @@ bleuio::ati .                  \ true
 bleuio::.response
 bleuio::gap-status .           \ true
 bleuio::.response
-bleuio::close
 ```
 
 `bleuio::command ( data length -- success? )` accepts a command without CR or
@@ -368,6 +384,37 @@ LF and appends CRLF itself.  Protocol-level `ERROR` or a nonzero verbose
 `error-code@` available for inspection.  Transport, framing, timeout, and
 capacity failures raise.  The convenience words currently include `at`,
 `ati`, `central`, `peripheral`, and `gap-status`.
+
+With `bleuio_scan.fs` loaded, continue in that same open session to test a
+finite scan, then close only after all work is complete:
+
+```forth
+2 bleuio::gap-scan .          \ true after a natural two-second scan
+bleuio::.scan-results         \ print the retained raw S records
+bleuio::scan-count@ .
+bleuio::scan-dropped@ .
+bleuio::scan-end@ type cr     \ matching SE / "scan completed" record
+bleuio::at .                  \ must still succeed immediately afterward
+bleuio::close
+```
+
+`gap-scan ( seconds -- success? )` accepts 1 through 30 seconds and owns the
+BleuIO command lock and CDC transaction until the matching scan-end record has
+been consumed.  It retains at most 32 complete raw `S` records of at most 256
+bytes each; further records are drained and counted rather than blocking USB.
+The accessors `scan-result@`, `scan-count@`, `scan-dropped@`,
+`scan-oversize@`, `scan-unknown-count@`, `scan-end@`, and
+`scan-last-unknown@` expose the bounded results and diagnostics.  Inspect them
+after `gap-scan` has returned; no consistent snapshot is promised while a scan
+is still running.
+
+`request-scan-stop` is intended for another Forth task while `gap-scan` is
+blocked.  It requests one raw ETX byte and the scan owner continues draining
+until the matching `SE`; a clean controlled stop returns false with
+`scan-aborted?` true and leaves the stream usable.  If the matching end record
+cannot be recovered within the bounded drain period, the operation raises and
+latches `bleuio::resync-required?`; reset and re-enumerate before issuing any
+more commands.
 
 Two different timeout cases must not be confused.  A completed endpoint IN
 request with USB transfer status `TIMEOUT` (`0x8B`) and actual length 0 is a
@@ -436,10 +483,10 @@ control, hot-plug policy above the core-1 transport, or CDC notification
 handling.  The class helper intentionally accepts only a validated CDC ACM
 control interface with one Union-linked alternate-zero data interface and
 exactly one bulk IN plus one bulk OUT endpoint.  General multi-device and
-multi-class policy remains future work.  The BleuIO module is presently a
-synchronous request/response layer; background scanning, unsolicited-event
-retention, and a broader JavaScript-library-equivalent command vocabulary are
-future layers.
+multi-class policy remains future work.  The BleuIO module now includes
+bounded synchronous GAP scanning, but not a background receive owner, general
+unsolicited-event retention, or the broader JavaScript-library-equivalent
+command vocabulary.  Those remain future layers.
 
 ## Upstream
 
